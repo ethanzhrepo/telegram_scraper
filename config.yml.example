@@ -1,0 +1,4 @@
+# Telegram API Credentials
+# Get these from https://my.telegram.org/
+api_id: 123123  # Replace with your actual API ID
+api_hash: "asdfasdfasdfa"  # Replace with your actual API Hash 
