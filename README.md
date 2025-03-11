@@ -42,7 +42,32 @@ conda activate telegram
 ```bash
 python main.py login
 ```
-This will generate a QR code in the `/tmp` directory and open it with your system's default image viewer. Scan the QR code with your Telegram mobile app to log in.
+
+### First-time Login Notes
+
+When logging in for the first time:
+
+1. You will be prompted to enter your phone number
+2. A verification code will be sent to your Telegram account (check your Telegram messages)
+3. Enter the verification code when prompted
+4. You may receive a security alert in your Telegram app - approve the login request
+
+
+### Session Management
+
+After successful login, a `telegram_session.session` file will be created in your working directory. This session file allows you to:
+
+- Skip the login process in future runs
+- Maintain your authenticated session across multiple uses
+- Continue using the tool without re-authenticating
+
+If you want to stop using this account:
+
+1. Go to Telegram's official client
+2. Navigate to Settings > Privacy and Security > Active Sessions
+3. Find and terminate the session created by this tool
+4. Delete the `telegram_session.session` file from your working directory
+
 
 ### List All Dialogs (Chats and Channels)
 ```bash
@@ -128,3 +153,5 @@ This tool was created with assistance from an AI programming assistant to help s
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## TODO 
