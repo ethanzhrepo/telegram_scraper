@@ -207,6 +207,7 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
     
     # 确定目标目录
     target_dir = os.path.join(channel_dir, message_type)
+    os.makedirs(target_dir, exist_ok=True)
     
     # 处理主媒体文件
     if message.media:
@@ -724,6 +725,25 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                                     print(f"No media files found in message ID {message.id}")
                             except Exception as e:
                                 print(f"Error downloading media from message ID {message.id}: {e}")
+                                traceback.print_exc()
+                        elif message_type == "text" and message.text:
+                            # 保存文本消息到text目录
+                            text_dir = os.path.join(channel_dir, "text")
+                            os.makedirs(text_dir, exist_ok=True)
+                            
+                            # 创建文本文件名（使用消息ID和时间戳）
+                            message_datetime = message.date.strftime("%Y%m%d_%H%M%S") if hasattr(message, 'date') else "unknown_date"
+                            text_filename = f"{message.id}_{message_datetime}.txt"
+                            text_file_path = os.path.join(text_dir, text_filename)
+                            
+                            try:
+                                # 保存文本内容到文件
+                                with open(text_file_path, 'w', encoding='utf-8') as f:
+                                    f.write(message.text)
+                                print(f"Saved text message ID {message.id} to {text_file_path}")
+                                total_downloaded += 1  # 计入总下载数
+                            except Exception as e:
+                                print(f"Error saving text from message ID {message.id}: {e}")
                                 traceback.print_exc()
                         else:
                             print(f"Skipping message ID {message.id} of type {message_type}")
