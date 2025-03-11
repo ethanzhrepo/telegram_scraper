@@ -46,26 +46,29 @@ This will generate a QR code in the `/tmp` directory and open it with your syste
 
 ### List All Dialogs (Chats and Channels)
 ```bash
-python main.py list
+python main.py list [--limit <count>]
 ```
 This will display all your chats and channels with their IDs.
+- `--limit <count>`: (Optional) Maximum number of dialogs to retrieve (default: 100)
 
 ### Download Media from a Chat
 ```bash
-python main.py download <chat_id> [limit] [--sleep <ms>]
+python main.py download <chat_id> [limit] [--sleep <ms>] [--type <types>]
 ```
 - `<chat_id>`: The ID of the chat or channel (obtained from the list command)
 - `[limit]`: (Optional) Maximum number of messages to process (default: 10)
 - `--sleep <ms>`: (Optional) Sleep time in milliseconds between message downloads (default: 500)
+- `--type <types>`: (Optional) Comma-separated list of content types to download (default: all)
 
 ### Download Media Using Task File
 ```bash
-python main.py download --file <task_file> --out <output_dir> [--sleep <ms>] [--limit <count>]
+python main.py download --file <task_file> --out <output_dir> [--sleep <ms>] [--limit <count>] [--type <types>]
 ```
 - `<task_file>`: Path to a YAML task file that defines what to download
 - `<output_dir>`: Directory where downloaded media will be saved
 - `--sleep <ms>`: (Optional) Sleep time in milliseconds between message downloads (default: 500)
 - `--limit <count>`: (Optional) Number of messages to retrieve (default: 500, 0 means all messages)
+- `--type <types>`: (Optional) Comma-separated list of content types to download (overrides task file settings)
 
 #### Task File Format
 Create a YAML file with the following structure:
@@ -73,8 +76,15 @@ Create a YAML file with the following structure:
 tasks:
   - name: task-name
     id: channel_id
-    type: "image"  # Type of media to download (image, video, document, etc.)
+    type: "image,video"  # Type of media to download (comma-separated list)
 ```
+
+**Important notes about the task file:**
+- The `type` field is required. If not specified, no media will be downloaded.
+- Valid types include: `text`, `image`, `video`, `voice`, `audio`, `document`
+- Multiple types can be specified by separating with commas: `"image,video,document"`
+- Only media types specified in the `type` field will be downloaded
+- Each task can have its own set of types to download
 
 ### Help
 ```bash
@@ -102,7 +112,8 @@ Displays available commands and their usage.
 | Option | Description |
 |--------|-------------|
 | `--sleep <ms>` | Sleep time in milliseconds between message downloads (default: 500) |
-| `--limit <count>` | Number of messages to retrieve (default: 500, 0 means all messages) |
+| `--limit <count>` | Number of messages/dialogs to retrieve (default varies by command) |
+| `--type <types>` | Comma-separated list of content types to download (default: all) |
 
 ## Requirements
 
@@ -117,4 +128,3 @@ This tool was created with assistance from an AI programming assistant to help s
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-

@@ -163,17 +163,18 @@ async def qr_login():
     await qr_login.wait()
     print("Login successful!")
 
-async def list_dialogs():
+async def list_dialogs(limit=100):
     """List all dialogs (chats and channels)"""
     result = await client(GetDialogsRequest(
         offset_date=None,
         offset_id=0,
         offset_peer=InputPeerEmpty(),
-        limit=100,
+        limit=limit,
         hash=0
     ))
     
     dialogs = result.dialogs
+    print(f"Found {len(dialogs)} dialogs (showing up to {limit}):")
     for dialog in dialogs:
         entity = await client.get_entity(dialog.peer)
         print(f"ID: {entity.id} - Name: {getattr(entity, 'title', getattr(entity, 'first_name', ''))}")
@@ -384,8 +385,9 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                 print(f"Using channel ID: {channel_id}, name: {channel_name}")
                 
                 # 获取媒体类型限制
-                allowed_types = []
+                allowed_types = []  # 默认为空列表
                 if 'type' in task and task['type']:
+                    # 解析类型配置，确保所有类型都转换为小写并去除空白
                     allowed_types = [t.strip().lower() for t in task['type'].split(',') if t.strip()]
                     print(f"Only downloading media types: {', '.join(allowed_types)}")
                 
@@ -436,10 +438,15 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                 sleep_ms = task_config['sleep_ms']
             
             # 获取媒体类型限制
-            allowed_types = []
+            allowed_types = []  # 默认为空列表
             if 'type' in task_config and task_config['type']:
+                # 解析类型配置，确保所有类型都转换为小写并去除空白
                 allowed_types = [t.strip().lower() for t in task_config['type'].split(',') if t.strip()]
                 print(f"Only downloading media types: {', '.join(allowed_types)}")
+            else:
+                # 如果没有指定类型，则不下载任何内容
+                print("No media types specified in task. No media will be downloaded.")
+                allowed_types = []  # 空列表表示不下载任何类型
             
             # 处理这个任务
             await process_single_channel(
@@ -652,9 +659,12 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
 
                         print(f"Message type: {message_type}")
                         
-                        # 如果指定了媒体类型，且当前消息类型不在列表中，则跳过
-                        if allowed_types and message_type not in ["unknown", "text"] and message_type not in allowed_types and "all" not in allowed_types:
-                            print(f"Skipping message ID {message.id} of type {message_type} (not in allowed types)")
+                        # 检查当前消息类型是否在允许下载的类型列表中
+                        # 如果不在allowed_types中且不是"all"，则跳过此消息
+                        if "all" not in allowed_types and message_type not in allowed_types:
+                            print(f"Skipping message ID {message.id} of type {message_type} (not in allowed types: {', '.join(allowed_types)})")
+                            # 更新进度（同时更新内存和文件）
+                            update_last_message_id(schedule_file, message.id)
                             continue
                         
                         # 检查是否是相册消息
@@ -727,7 +737,7 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                                 print(f"Error downloading media from message ID {message.id}: {e}")
                                 traceback.print_exc()
                         elif message_type == "text" and message.text:
-                            # 保存文本消息到text目录
+                            # 保存文本消息到text目录 - 由于上面已经检查过类型，这里不需要再判断
                             text_dir = os.path.join(channel_dir, "text")
                             os.makedirs(text_dir, exist_ok=True)
                             
@@ -763,11 +773,6 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                             # 获取消息类型
                             album_msg_info = await get_message_info(album_msg)
                             album_msg_type = album_msg_info["type"]
-                            
-                            # 如果指定了媒体类型并且此消息类型不在允许列表中，跳过
-                            if allowed_types and album_msg_type not in ["unknown", "text"] and album_msg_type not in allowed_types and "all" not in allowed_types:
-                                print(f"Skipping album message ID {album_msg.id} of type {album_msg_type} (not in allowed types)")
-                                continue
                             
                             # 处理相册消息的媒体
                             if album_msg_type not in ["text", "unknown"]:
@@ -840,83 +845,131 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
         print(f"Error in process_single_channel: {e}")
         traceback.print_exc()
 
-async def download_media(chat_id, limit=10, sleep_ms=500):
-    """Download media from a specific chat"""
-    entity = await client.get_entity(int(chat_id))
-    chat_name = getattr(entity, 'title', getattr(entity, 'first_name', 'chat'))
-    
-    # Create directory for downloads
-    download_dir = f"downloads/{chat_name}"
-    os.makedirs(download_dir, exist_ok=True)
-    
-    print(f"Downloading media from {chat_name}...")
-    print(f"Using sleep interval of {sleep_ms} milliseconds between messages")
-    
-    # Get messages with media
-    messages = await client.get_messages(entity, limit=limit, filter=lambda m: m.media is not None)
-    
-    # Sort messages by ID in ascending order for sequential processing
-    messages = sorted(messages, key=lambda m: m.id)
-    
-    # Track statistics
-    total_files = len(messages)
-    skipped_files = 0
-    downloaded_files = 0
-    
-    for message in messages:
-        print(f"Processing media from message ID: {message.id}")
+async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
+    """Download media from a chat"""
+    try:
+        # 如果没有指定允许的类型，默认允许所有类型
+        if allowed_types is None:
+            allowed_types = ["all"]  # 默认下载所有类型
         
-        # Generate a temporary path to download the file for hash calculation
-        temp_path = os.path.join(tempfile.gettempdir(), f'temp_media_{message.id}')
+        # 获取聊天实体
+        entity = await client.get_entity(int(chat_id))
+        chat_name = getattr(entity, 'title', getattr(entity, 'first_name', 'chat'))
         
-        try:
-            # Download to temp location
-            await client.download_media(message, temp_path)
+        # 创建下载目录
+        download_dir = f"downloads/{chat_name}"
+        os.makedirs(download_dir, exist_ok=True)
+        
+        # 为每种媒体类型创建子目录
+        for media_type in ['text', 'image', 'video', 'voice', 'audio', 'document']:
+            media_dir = os.path.join(download_dir, media_type)
+            os.makedirs(media_dir, exist_ok=True)
+        
+        print(f"Downloading media from {chat_name}...")
+        print(f"Using sleep interval of {sleep_ms} milliseconds between messages")
+        
+        # 获取消息
+        # 注意：我们不再只获取带媒体的消息，因为我们也可能需要处理文本消息
+        messages = await client.get_messages(entity, limit=limit)
+        
+        # 按ID升序排序以顺序处理
+        messages = sorted(messages, key=lambda m: m.id)
+        
+        # 跟踪统计信息
+        total_files = len(messages)
+        skipped_files = 0
+        downloaded_files = 0
+        
+        for message in messages:
+            # 获取消息类型
+            message_type = get_message_type(message)
+            print(f"Processing message ID {message.id} of type: {message_type}")
             
-            # 计算文件哈希值
-            file_hash = calculate_file_hash(temp_path)
+            # 检查类型是否在允许列表中
+            if "all" not in allowed_types and message_type not in allowed_types:
+                print(f"Skipping message ID {message.id} of type {message_type} (not in allowed types: {', '.join(allowed_types)})")
+                skipped_files += 1
+                continue
             
-            # Get file extension
-            file_extension = os.path.splitext(temp_path)[1] or '.bin'
-            
-            # Create final path with hash in filename
-            final_path = os.path.join(download_dir, f"{message.id}_{file_hash[:16]}{file_extension}")
-            
-            # Copy file from temp to final location
-            import shutil
-            shutil.copy2(temp_path, final_path)
-            os.remove(temp_path)
-            
-            print(f"Downloaded to {final_path}")
-            downloaded_files += 1
-        except Exception as e:
-            print(f"Error downloading message ID {message.id}: {e}")
-            traceback.print_exc()
-            if os.path.exists(temp_path):
+            # 根据消息类型处理
+            if message_type == "text" and message.text:
+                # 保存文本消息
+                text_dir = os.path.join(download_dir, "text")
+                message_datetime = message.date.strftime("%Y%m%d_%H%M%S") if hasattr(message, 'date') else "unknown_date"
+                text_filename = f"{message.id}_{message_datetime}.txt"
+                text_file_path = os.path.join(text_dir, text_filename)
+                
                 try:
+                    with open(text_file_path, 'w', encoding='utf-8') as f:
+                        f.write(message.text)
+                    print(f"Saved text message ID {message.id} to {text_file_path}")
+                    downloaded_files += 1
+                except Exception as e:
+                    print(f"Error saving text from message ID {message.id}: {e}")
+            
+            # 处理带媒体的消息
+            elif message.media:
+                # 生成临时路径来下载文件进行哈希计算
+                temp_path = os.path.join(tempfile.gettempdir(), f'temp_media_{message.id}')
+                
+                try:
+                    # 下载到临时位置
+                    await client.download_media(message, temp_path)
+                    
+                    # 计算文件哈希值
+                    file_hash = calculate_file_hash(temp_path)
+                    
+                    # 获取文件扩展名
+                    file_extension = os.path.splitext(temp_path)[1] or '.bin'
+                    
+                    # 创建最终路径，使用哈希值命名
+                    media_type_dir = os.path.join(download_dir, message_type)
+                    final_path = os.path.join(media_type_dir, f"{message.id}_{file_hash[:16]}{file_extension}")
+                    
+                    # 复制文件从临时位置到最终位置
+                    import shutil
+                    shutil.copy2(temp_path, final_path)
                     os.remove(temp_path)
-                except:
-                    pass
+                    
+                    print(f"Downloaded to {final_path}")
+                    downloaded_files += 1
+                except Exception as e:
+                    print(f"Error downloading message ID {message.id}: {e}")
+                    traceback.print_exc()
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
+            else:
+                print(f"Skipping message ID {message.id} - no media or text content")
+                skipped_files += 1
+            
+            # 消息间休眠以避免速率限制
+            await asyncio.sleep(sleep_ms / 1000)
         
-        # Sleep between messages to avoid rate limiting
-        await asyncio.sleep(sleep_ms / 1000)
+        print(f"\nDownload summary:")
+        print(f"Total messages processed: {total_files}")
+        print(f"Files downloaded: {downloaded_files}")
+        print(f"Files skipped: {skipped_files}")
     
-    print(f"\nDownload summary:")
-    print(f"Total files processed: {total_files}")
-    print(f"Files downloaded: {downloaded_files}")
-    print(f"Files skipped: {skipped_files}")
+    except Exception as e:
+        print(f"Error: {e}")
+        traceback.print_exc()
 
 def print_help():
     """Print help message"""
     print("Usage:")
     print("  python main.py login - Login using QR code")
-    print("  python main.py list - List all dialogs")
-    print("  python main.py download <chat_id> [limit] - Download media from a chat")
-    print("  python main.py download --file <task_file> --out <output_dir> [--sleep <ms>] [--limit <count>] - Download based on task file")
+    print("  python main.py list [--limit <count>] - List all dialogs")
+    print("  python main.py download <chat_id> [limit] [--sleep <ms>] [--type <types>] - Download media from a chat")
+    print("  python main.py download --file <task_file> --out <output_dir> [--sleep <ms>] [--limit <count>] [--type <types>] - Download based on task file")
     print("  python main.py help - Show this help message")
     print("\nOptions:")
     print("  --sleep <ms>  - Sleep time in milliseconds between message downloads (default: 500)")
-    print("  --limit <count> - Number of messages to retrieve (default: 500, 0 means all messages)")
+    print("  --limit <count> - Number of messages/dialogs to retrieve (default varies by command)")
+    print("  --type <types> - Comma-separated list of content types to download (default: all)")
+    print("\nValid types: text, image, video, audio, voice, document (or 'all' for all types)")
 
 async def main():
     """Main function"""
@@ -929,11 +982,28 @@ async def main():
     if command == "login":
         await qr_login()
     elif command == "list":
-        await list_dialogs()
+        # 处理list命令的--limit参数
+        limit = 100  # 默认显示100个对话
+        
+        # 检查命令行参数
+        i = 2
+        while i < len(sys.argv) - 1:
+            if sys.argv[i] == "--limit":
+                try:
+                    limit = int(sys.argv[i + 1])
+                    i += 2
+                except (ValueError, IndexError):
+                    print("Invalid limit value. Using default 100 dialogs.")
+                    i += 1
+            else:
+                i += 1
+        
+        await list_dialogs(limit)
     elif command == "download":
         # Parse sleep parameter if provided
         sleep_ms = 500  # Default sleep time in milliseconds
         limit = 500  # Default number of messages to retrieve
+        allowed_types = ["all"]  # 默认下载所有类型
         
         # Check for parameters anywhere in the arguments
         i = 2
@@ -958,6 +1028,18 @@ async def main():
                 except (ValueError, IndexError):
                     print("Invalid limit value. Using default 500 messages.")
                     i += 2
+            elif sys.argv[i] == "--type":
+                try:
+                    type_value = sys.argv[i + 1]
+                    if type_value and type_value.lower() != "all":
+                        allowed_types = [t.strip().lower() for t in type_value.split(',') if t.strip()]
+                    # Remove these arguments to simplify further parsing
+                    sys.argv.pop(i)
+                    sys.argv.pop(i)
+                    continue  # Don't increment i as we've removed elements
+                except (IndexError):
+                    print("Invalid type value. Using default (all types).")
+                    i += 2
             else:
                 i += 1
         
@@ -970,7 +1052,7 @@ async def main():
         elif len(sys.argv) >= 3:
             chat_id = sys.argv[2]
             limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 10
-            await download_media(chat_id, limit, sleep_ms)
+            await download_media(chat_id, limit, sleep_ms, allowed_types)
         else:
             print("Invalid download command")
             print_help()
