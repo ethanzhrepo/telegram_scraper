@@ -164,20 +164,82 @@ async def qr_login():
     print("Login successful!")
 
 async def list_dialogs(limit=100):
-    """List all dialogs (chats and channels)"""
-    result = await client(GetDialogsRequest(
-        offset_date=None,
-        offset_id=0,
-        offset_peer=InputPeerEmpty(),
-        limit=limit,
-        hash=0
-    ))
+    """List all dialogs (chats and channels)
     
-    dialogs = result.dialogs
-    print(f"Found {len(dialogs)} dialogs (showing up to {limit}):")
-    for dialog in dialogs:
-        entity = await client.get_entity(dialog.peer)
-        print(f"ID: {entity.id} - Name: {getattr(entity, 'title', getattr(entity, 'first_name', ''))}")
+    This function automatically fetches all dialogs by making multiple requests
+    with appropriate offset values. The limit parameter controls how many dialogs
+    are fetched in each request.
+    """
+    total_count = 0
+    
+    # For pagination
+    offset_date = None
+    offset_id = 0
+    offset_peer = InputPeerEmpty()
+    
+    print(f"Fetching all dialogs (in batches of {limit})...")
+    print("\nDialogs:")
+    
+    while True:
+        try:
+            result = await client(GetDialogsRequest(
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_peer=offset_peer,
+                limit=limit,
+                hash=0
+            ))
+            
+            # If no dialogs returned, we've reached the end
+            if not result.dialogs:
+                print("No more dialogs found.")
+                break
+                
+            # Process and display each dialog immediately
+            for dialog in result.dialogs:
+                try:
+                    entity = await client.get_entity(dialog.peer)
+                    name = getattr(entity, 'title', getattr(entity, 'first_name', ''))
+                    print(f"ID: {entity.id} - Name: {name}")
+                    total_count += 1
+                except Exception as e:
+                    print(f"Error getting entity: {e}")
+            
+            print(f"Fetched {len(result.dialogs)} more dialogs. Total so far: {total_count}")
+            
+            # If we got fewer dialogs than requested, we've reached the end
+            if len(result.dialogs) < limit:
+                print("Reached the end of the dialog list.")
+                break
+                
+            # Update offset for next iteration - use the last dialog as reference
+            last_dialog = result.dialogs[-1]
+            last_message = None
+            
+            # Find the message corresponding to the last dialog
+            for message in result.messages:
+                if message.peer_id == last_dialog.peer:
+                    last_message = message
+                    break
+            
+            if last_message:
+                offset_date = last_message.date
+                offset_id = last_message.id
+            else:
+                # Fallback if we can't find the corresponding message
+                offset_id = last_dialog.top_message
+                
+            offset_peer = last_dialog.peer
+            
+            # Add a small delay to avoid hitting rate limits
+            await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            print(f"Error fetching dialogs: {e}")
+            traceback.print_exc()
+            break
+    
+    print(f"\nFound {total_count} dialogs in total.")
 
 # 添加文件哈希计算函数
 def calculate_file_hash(file_path):
@@ -213,12 +275,14 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
     # 处理主媒体文件
     if message.media:
         media_count += 1
-        # 生成临时文件路径
-        temp_path = os.path.join(tempfile.gettempdir(), f'{temp_dir_prefix}_media_{message.id}')
         
         try:
-            # 下载到临时位置
-            downloaded_path = await client.download_media(message, temp_path)
+            # 生成一个唯一的文件名前缀
+            file_prefix = f"{message.id}_"
+            
+            # 直接下载到目标目录，使用临时文件名
+            temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
+            downloaded_path = await client.download_media(message, temp_target_path)
             
             if downloaded_path:
                 # 计算文件哈希值
@@ -229,22 +293,22 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                 if not file_extension:
                     file_extension = '.bin'
                 
-                # 创建最终路径，使用哈希值命名
-                final_path = os.path.join(target_dir, f"{message.id}_{file_hash[:16]}{file_extension}")
+                # 创建最终文件名，使用哈希值
+                final_path = os.path.join(target_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
                 
-                # 复制文件到最终位置
-                import shutil
-                shutil.copy2(downloaded_path, final_path)
-                os.remove(downloaded_path)
+                # 重命名文件到最终名称
+                os.rename(downloaded_path, final_path)
                 
                 print(f"Downloaded media to {final_path}")
                 downloaded_files.append(final_path)
         except Exception as e:
             print(f"Error downloading main media from message ID {message.id}: {e}")
             traceback.print_exc()
-            if os.path.exists(temp_path):
+            # 清理可能存在的临时文件
+            temp_target_path = os.path.join(target_dir, f"{message.id}_temp")
+            if os.path.exists(temp_target_path):
                 try:
-                    os.remove(temp_path)
+                    os.remove(temp_target_path)
                 except:
                     pass
     
@@ -271,13 +335,13 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
             
             # 如果检测到有多个媒体，尝试下载它们
             if has_grouped_media:
-                # 生成临时文件路径
-                grouped_temp_path = os.path.join(tempfile.gettempdir(), f'{temp_dir_prefix}_grouped_{message.id}')
-                
                 try:
-                    # 尝试下载可能包含的其他媒体
-                    # 使用专用API来获取和下载groupedMedia
-                    grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_path)
+                    # 生成一个唯一的文件名前缀
+                    grouped_prefix = f"{message.id}_grouped_"
+                    
+                    # 直接下载到目标目录，使用临时文件名
+                    grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
+                    grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_target_path)
                     
                     if grouped_downloaded_path:
                         # 计算文件哈希值
@@ -288,16 +352,14 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                         if not grouped_file_extension:
                             grouped_file_extension = '.bin'
                         
-                        # 创建最终路径，使用哈希值命名
+                        # 创建最终文件名，使用哈希值
                         grouped_final_path = os.path.join(
                             target_dir, 
-                            f"{message.id}_grouped_{grouped_file_hash[:16]}{grouped_file_extension}"
+                            f"{grouped_prefix}{grouped_file_hash[:16]}{grouped_file_extension}"
                         )
                         
-                        # 复制文件到最终位置
-                        import shutil
-                        shutil.copy2(grouped_downloaded_path, grouped_final_path)
-                        os.remove(grouped_downloaded_path)
+                        # 重命名文件到最终名称
+                        os.rename(grouped_downloaded_path, grouped_final_path)
                         
                         print(f"Downloaded grouped media to {grouped_final_path}")
                         downloaded_files.append(grouped_final_path)
@@ -305,9 +367,11 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                 except Exception as e:
                     print(f"Error downloading grouped media from message ID {message.id}: {e}")
                     traceback.print_exc()
-                    if os.path.exists(grouped_temp_path):
+                    # 清理可能存在的临时文件
+                    grouped_temp_target_path = os.path.join(target_dir, f"{message.id}_grouped_temp")
+                    if os.path.exists(grouped_temp_target_path):
                         try:
-                            os.remove(grouped_temp_path)
+                            os.remove(grouped_temp_target_path)
                         except:
                             pass
         except Exception as e:
@@ -909,36 +973,42 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
             
             # 处理带媒体的消息
             elif message.media:
-                # 生成临时路径来下载文件进行哈希计算
-                temp_path = os.path.join(tempfile.gettempdir(), f'temp_media_{message.id}')
-                
                 try:
-                    # 下载到临时位置
-                    await client.download_media(message, temp_path)
-                    
-                    # 计算文件哈希值
-                    file_hash = calculate_file_hash(temp_path)
-                    
-                    # 获取文件扩展名
-                    file_extension = os.path.splitext(temp_path)[1] or '.bin'
-                    
-                    # 创建最终路径，使用哈希值命名
+                    # 确定目标目录
                     media_type_dir = os.path.join(download_dir, message_type)
-                    final_path = os.path.join(media_type_dir, f"{message.id}_{file_hash[:16]}{file_extension}")
                     
-                    # 复制文件从临时位置到最终位置
-                    import shutil
-                    shutil.copy2(temp_path, final_path)
-                    os.remove(temp_path)
+                    # 生成一个唯一的文件名前缀
+                    file_prefix = f"{message.id}_"
                     
-                    print(f"Downloaded to {final_path}")
-                    downloaded_files += 1
+                    # 直接下载到目标目录，使用临时文件名
+                    temp_target_path = os.path.join(media_type_dir, f"{file_prefix}temp")
+                    downloaded_path = await client.download_media(message, temp_target_path)
+                    
+                    if downloaded_path:
+                        # 计算文件哈希值
+                        file_hash = calculate_file_hash(downloaded_path)
+                        
+                        # 获取文件扩展名
+                        _, file_extension = os.path.splitext(downloaded_path)
+                        if not file_extension:
+                            file_extension = '.bin'
+                        
+                        # 创建最终文件名，使用哈希值
+                        final_path = os.path.join(media_type_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
+                        
+                        # 重命名文件到最终名称
+                        os.rename(downloaded_path, final_path)
+                        
+                        print(f"Downloaded to {final_path}")
+                        downloaded_files += 1
                 except Exception as e:
                     print(f"Error downloading message ID {message.id}: {e}")
                     traceback.print_exc()
-                    if os.path.exists(temp_path):
+                    # 清理可能存在的临时文件
+                    temp_target_path = os.path.join(media_type_dir, f"{message.id}_temp")
+                    if os.path.exists(temp_target_path):
                         try:
-                            os.remove(temp_path)
+                            os.remove(temp_target_path)
                         except:
                             pass
             else:
@@ -961,13 +1031,13 @@ def print_help():
     """Print help message"""
     print("Usage:")
     print("  python main.py login - Login using QR code")
-    print("  python main.py list [--limit <count>] - List all dialogs")
+    print("  python main.py list - List all dialogs")
     print("  python main.py download <chat_id> [limit] [--sleep <ms>] [--type <types>] - Download media from a chat")
     print("  python main.py download --file <task_file> --out <output_dir> [--sleep <ms>] [--limit <count>] [--type <types>] - Download based on task file")
     print("  python main.py help - Show this help message")
     print("\nOptions:")
     print("  --sleep <ms>  - Sleep time in milliseconds between message downloads (default: 500)")
-    print("  --limit <count> - Number of messages/dialogs to retrieve (default varies by command)")
+    print("  --limit <count> - Number of messages to retrieve for download commands (default: 500)")
     print("  --type <types> - Comma-separated list of content types to download (default: all)")
     print("\nValid types: text, image, video, audio, voice, document (or 'all' for all types)")
 
@@ -982,23 +1052,8 @@ async def main():
     if command == "login":
         await qr_login()
     elif command == "list":
-        # 处理list命令的--limit参数
-        limit = 100  # 默认显示100个对话
-        
-        # 检查命令行参数
-        i = 2
-        while i < len(sys.argv) - 1:
-            if sys.argv[i] == "--limit":
-                try:
-                    limit = int(sys.argv[i + 1])
-                    i += 2
-                except (ValueError, IndexError):
-                    print("Invalid limit value. Using default 100 dialogs.")
-                    i += 1
-            else:
-                i += 1
-        
-        await list_dialogs(limit)
+        # Call list_dialogs with default batch size of 100
+        await list_dialogs()
     elif command == "download":
         # Parse sleep parameter if provided
         sleep_ms = 500  # Default sleep time in milliseconds
