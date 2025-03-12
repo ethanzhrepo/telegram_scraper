@@ -71,19 +71,9 @@ If you want to stop using this account:
 
 ### List All Dialogs (Chats and Channels)
 ```bash
-python main.py list [--limit <count>]
+python main.py list
 ```
 This will display all your chats and channels with their IDs.
-- `--limit <count>`: (Optional) Maximum number of dialogs to retrieve (default: 100)
-
-### Download Media from a Chat
-```bash
-python main.py download <chat_id> [limit] [--sleep <ms>] [--type <types>]
-```
-- `<chat_id>`: The ID of the chat or channel (obtained from the list command)
-- `[limit]`: (Optional) Maximum number of messages to process (default: 10)
-- `--sleep <ms>`: (Optional) Sleep time in milliseconds between message downloads (default: 500)
-- `--type <types>`: (Optional) Comma-separated list of content types to download (default: all)
 
 ### Download Media Using Task File
 ```bash
