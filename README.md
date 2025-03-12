@@ -2,6 +2,15 @@
 
 A Python tool to download resources from Telegram chats and channels using the Telethon library.
 
+
+![GitHub commit activity](https://img.shields.io/github/commit-activity/w/ethanzhrepo/telegram_scraper)
+![GitHub Release](https://img.shields.io/github/v/release/ethanzhrepo/telegram_scraper)
+![GitHub Repo stars](https://img.shields.io/github/stars/ethanzhrepo/telegram_scraper)
+
+![License](https://img.shields.io/github/license/ethanzhrepo/telegram_scraper)
+![Twitter Follow](https://img.shields.io/twitter/follow/0x99_Ethan?style=social)
+
+
 ## Setup
 
 ### 1. Get Telegram API Credentials
