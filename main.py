@@ -286,7 +286,8 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
             
             if downloaded_path:
                 # 计算文件哈希值
-                file_hash = calculate_file_hash(downloaded_path)
+                # file_hash = calculate_file_hash(downloaded_path)
+                file_hash = "nohash"
                 
                 # 获取文件扩展名
                 _, file_extension = os.path.splitext(downloaded_path)
