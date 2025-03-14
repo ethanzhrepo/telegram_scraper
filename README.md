@@ -34,20 +34,20 @@ api_hash: "your_api_hash_here"  # Replace with your actual API Hash
 
 ### 3. Install Dependencies
 
-#### Using pip:
-```bash
-pip install -r requirements.txt
-```
-
 #### Using conda:
 ```bash
 conda env create -f environment.yml
 conda activate telegram
 ```
 
+#### Using pip:
+```bash
+pip install -r requirements.txt
+```
+
 ## Usage
 
-### Login with QR Code
+### Login
 ```bash
 python main.py login
 ```
