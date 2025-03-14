@@ -242,14 +242,14 @@ async def list_dialogs(limit=100):
     print(f"\nFound {total_count} dialogs in total.")
 
 # 添加文件哈希计算函数
-def calculate_file_hash(file_path):
-    """计算文件的SHA-256哈希值"""
-    sha256_hash = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        # 分块读取文件以处理大文件
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+# def calculate_file_hash(file_path):
+#     """计算文件的SHA-256哈希值"""
+#     sha256_hash = hashlib.sha256()
+#     with open(file_path, "rb") as f:
+#         # 分块读取文件以处理大文件
+#         for byte_block in iter(lambda: f.read(4096), b""):
+#             sha256_hash.update(byte_block)
+#     return sha256_hash.hexdigest()
 
 # 添加一个函数来处理消息中的所有媒体文件
 async def download_all_media_from_message(message, channel_dir, temp_dir_prefix):
@@ -346,7 +346,8 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                     
                     if grouped_downloaded_path:
                         # 计算文件哈希值
-                        grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
+                        # grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
+                        grouped_file_hash = "nohash"
                         
                         # 获取文件扩展名
                         _, grouped_file_extension = os.path.splitext(grouped_downloaded_path)
@@ -987,7 +988,8 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
                     
                     if downloaded_path:
                         # 计算文件哈希值
-                        file_hash = calculate_file_hash(downloaded_path)
+                        # file_hash = calculate_file_hash(downloaded_path)
+                        file_hash = "nohash"
                         
                         # 获取文件扩展名
                         _, file_extension = os.path.splitext(downloaded_path)
