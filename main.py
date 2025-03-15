@@ -274,44 +274,69 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
     
     # 处理主媒体文件
     if message.media:
-        media_count += 1
+        # 生成一个唯一的文件名前缀
+        file_prefix = f"{message.id}_"
         
-        try:
-            # 生成一个唯一的文件名前缀
-            file_prefix = f"{message.id}_"
+        # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
+        # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
+        existing_files = [f for f in os.listdir(target_dir) 
+                         if f.startswith(file_prefix) and "temp" not in f]
+        
+        # 清理可能存在的临时文件（未完成的下载）
+        # 修复：查找所有包含"temp"的文件
+        temp_files = [f for f in os.listdir(target_dir) 
+                     if f.startswith(file_prefix) and "temp" in f]
+        for temp_file in temp_files:
+            try:
+                os.remove(os.path.join(target_dir, temp_file))
+                print(f"Removed incomplete download: {temp_file}")
+            except Exception as e:
+                print(f"Error removing temporary file {temp_file}: {e}")
+        
+        if existing_files:
+            # 文件已存在，跳过下载
+            existing_file = existing_files[0]  # 取第一个匹配的文件
+            existing_path = os.path.join(target_dir, existing_file)
+            print(f"Complete file already exists: {existing_path} - Skipping download")
+            downloaded_files.append(existing_path)
+            media_count += 1
+        else:
+            # 文件不存在或只有临时文件，进行下载
+            media_count += 1
             
-            # 直接下载到目标目录，使用临时文件名
-            temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
-            downloaded_path = await client.download_media(message, temp_target_path)
-            
-            if downloaded_path:
-                # 计算文件哈希值
-                # file_hash = calculate_file_hash(downloaded_path)
-                file_hash = "nohash"
+            try:
+                # 直接下载到目标目录，使用临时文件名
+                temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
+                downloaded_path = await client.download_media(message, temp_target_path)
                 
-                # 获取文件扩展名
-                _, file_extension = os.path.splitext(downloaded_path)
-                if not file_extension:
-                    file_extension = '.bin'
-                
-                # 创建最终文件名，使用哈希值
-                final_path = os.path.join(target_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
-                
-                # 重命名文件到最终名称
-                os.rename(downloaded_path, final_path)
-                
-                print(f"Downloaded media to {final_path}")
-                downloaded_files.append(final_path)
-        except Exception as e:
-            print(f"Error downloading main media from message ID {message.id}: {e}")
-            traceback.print_exc()
-            # 清理可能存在的临时文件
-            temp_target_path = os.path.join(target_dir, f"{message.id}_temp")
-            if os.path.exists(temp_target_path):
-                try:
-                    os.remove(temp_target_path)
-                except:
-                    pass
+                if downloaded_path:
+                    # 计算文件哈希值
+                    # file_hash = calculate_file_hash(downloaded_path)
+                    file_hash = "nohash"
+                    
+                    # 获取文件扩展名
+                    _, file_extension = os.path.splitext(downloaded_path)
+                    if not file_extension:
+                        file_extension = '.bin'
+                    
+                    # 创建最终文件名，使用哈希值
+                    final_path = os.path.join(target_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
+                    
+                    # 重命名文件到最终名称
+                    os.rename(downloaded_path, final_path)
+                    
+                    print(f"Downloaded media to {final_path}")
+                    downloaded_files.append(final_path)
+            except Exception as e:
+                print(f"Error downloading main media from message ID {message.id}: {e}")
+                traceback.print_exc()
+                # 清理可能存在的临时文件
+                temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
+                if os.path.exists(temp_target_path):
+                    try:
+                        os.remove(temp_target_path)
+                    except:
+                        pass
     
     # 处理消息中的多媒体内容 - 改进版
     if hasattr(message, 'media') and hasattr(message.media, 'document'):
@@ -330,52 +355,72 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
             for attribute in message.media.document.attributes:
                 if hasattr(attribute, 'file_name') and attribute.file_name:
                     # 可能是包含多个媒体的文件
-                    if mime_type.startswith('image/') or mime_type.startswith('video/'):
+                    if mime_type.startswith('image/'): # or mime_type.startswith('video/'):
                         has_grouped_media = True
                         break
             
-            # 如果检测到有多个媒体，尝试下载它们
             if has_grouped_media:
-                try:
-                    # 生成一个唯一的文件名前缀
-                    grouped_prefix = f"{message.id}_grouped_"
-                    
-                    # 直接下载到目标目录，使用临时文件名
-                    grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
-                    grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_target_path)
-                    
-                    if grouped_downloaded_path:
-                        # 计算文件哈希值
-                        # grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
-                        grouped_file_hash = "nohash"
+                # 生成一个唯一的文件名前缀
+                grouped_prefix = f"{message.id}_grouped_"
+                
+                # 检查目标目录中是否已经存在以该前缀开头的文件
+                # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
+                existing_grouped_files = [f for f in os.listdir(target_dir) 
+                                         if f.startswith(grouped_prefix) and "temp" not in f]
+                
+                # 清理可能存在的临时文件（未完成的下载）
+                # 修复：查找所有包含"temp"的文件
+                grouped_temp_files = [f for f in os.listdir(target_dir) 
+                                     if f.startswith(grouped_prefix) and "temp" in f]
+                for grouped_temp_file in grouped_temp_files:
+                    try:
+                        os.remove(os.path.join(target_dir, grouped_temp_file))
+                        print(f"Removed incomplete grouped download: {grouped_temp_file}")
+                    except Exception as e:
+                        print(f"Error removing temporary grouped file {grouped_temp_file}: {e}")
+                
+                if existing_grouped_files:
+                    # 文件已存在，跳过下载
+                    existing_grouped_file = existing_grouped_files[0]  # 取第一个匹配的文件
+                    existing_grouped_path = os.path.join(target_dir, existing_grouped_file)
+                    print(f"Complete grouped file already exists: {existing_grouped_path} - Skipping download")
+                    downloaded_files.append(existing_grouped_path)
+                    media_count += 1
+                else:
+                    # 文件不存在或只有临时文件，进行下载
+                    try:
+                        grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
+                        grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_target_path)
                         
-                        # 获取文件扩展名
-                        _, grouped_file_extension = os.path.splitext(grouped_downloaded_path)
-                        if not grouped_file_extension:
-                            grouped_file_extension = '.bin'
-                        
-                        # 创建最终文件名，使用哈希值
-                        grouped_final_path = os.path.join(
-                            target_dir, 
-                            f"{grouped_prefix}{grouped_file_hash[:16]}{grouped_file_extension}"
-                        )
-                        
-                        # 重命名文件到最终名称
-                        os.rename(grouped_downloaded_path, grouped_final_path)
-                        
-                        print(f"Downloaded grouped media to {grouped_final_path}")
-                        downloaded_files.append(grouped_final_path)
-                        media_count += 1
-                except Exception as e:
-                    print(f"Error downloading grouped media from message ID {message.id}: {e}")
-                    traceback.print_exc()
-                    # 清理可能存在的临时文件
-                    grouped_temp_target_path = os.path.join(target_dir, f"{message.id}_grouped_temp")
-                    if os.path.exists(grouped_temp_target_path):
-                        try:
-                            os.remove(grouped_temp_target_path)
-                        except:
-                            pass
+                        if grouped_downloaded_path:
+                            # grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
+                            grouped_file_hash = "nohash"
+                            
+                            _, grouped_file_extension = os.path.splitext(grouped_downloaded_path)
+                            if not grouped_file_extension:
+                                grouped_file_extension = '.bin'
+                            
+                            grouped_final_path = os.path.join(
+                                target_dir, 
+                                f"{grouped_prefix}{grouped_file_hash[:16]}{grouped_file_extension}"
+                            )
+                            
+                            os.rename(grouped_downloaded_path, grouped_final_path)
+                            
+                            print(f"Downloaded grouped media to {grouped_final_path}")
+                            downloaded_files.append(grouped_final_path)
+                            media_count += 1
+                    except Exception as e:
+                        print(f"Error downloading grouped media from message ID {message.id}: {e}")
+                        traceback.print_exc()
+                        # 清理可能存在的临时文件
+                        grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
+                        if os.path.exists(grouped_temp_target_path):
+                            try:
+                                os.remove(grouped_temp_target_path)
+                            except:
+                                pass
+                 
         except Exception as e:
             print(f"Error checking for grouped media in message ID {message.id}: {e}")
             traceback.print_exc()
@@ -982,33 +1027,57 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
                     # 生成一个唯一的文件名前缀
                     file_prefix = f"{message.id}_"
                     
-                    # 直接下载到目标目录，使用临时文件名
-                    temp_target_path = os.path.join(media_type_dir, f"{file_prefix}temp")
-                    downloaded_path = await client.download_media(message, temp_target_path)
+                    # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
+                    # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
+                    existing_files = [f for f in os.listdir(media_type_dir) 
+                                     if f.startswith(file_prefix) and "temp" not in f]
                     
-                    if downloaded_path:
-                        # 计算文件哈希值
-                        # file_hash = calculate_file_hash(downloaded_path)
-                        file_hash = "nohash"
-                        
-                        # 获取文件扩展名
-                        _, file_extension = os.path.splitext(downloaded_path)
-                        if not file_extension:
-                            file_extension = '.bin'
-                        
-                        # 创建最终文件名，使用哈希值
-                        final_path = os.path.join(media_type_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
-                        
-                        # 重命名文件到最终名称
-                        os.rename(downloaded_path, final_path)
-                        
-                        print(f"Downloaded to {final_path}")
+                    # 清理可能存在的临时文件（未完成的下载）
+                    # 修复：查找所有包含"temp"的文件
+                    temp_files = [f for f in os.listdir(media_type_dir) 
+                                 if f.startswith(file_prefix) and "temp" in f]
+                    for temp_file in temp_files:
+                        try:
+                            os.remove(os.path.join(media_type_dir, temp_file))
+                            print(f"Removed incomplete download: {temp_file}")
+                        except Exception as e:
+                            print(f"Error removing temporary file {temp_file}: {e}")
+                    
+                    if existing_files:
+                        # 文件已存在，跳过下载
+                        existing_file = existing_files[0]  # 取第一个匹配的文件
+                        existing_path = os.path.join(media_type_dir, existing_file)
+                        print(f"Complete file already exists: {existing_path} - Skipping download")
                         downloaded_files += 1
+                    else:
+                        # 文件不存在或只有临时文件，进行下载
+                        # 直接下载到目标目录，使用临时文件名
+                        temp_target_path = os.path.join(media_type_dir, f"{file_prefix}temp")
+                        downloaded_path = await client.download_media(message, temp_target_path)
+                        
+                        if downloaded_path:
+                            # 计算文件哈希值
+                            # file_hash = calculate_file_hash(downloaded_path)
+                            file_hash = "nohash"
+                            
+                            # 获取文件扩展名
+                            _, file_extension = os.path.splitext(downloaded_path)
+                            if not file_extension:
+                                file_extension = '.bin'
+                            
+                            # 创建最终文件名，使用哈希值
+                            final_path = os.path.join(media_type_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
+                            
+                            # 重命名文件到最终名称
+                            os.rename(downloaded_path, final_path)
+                            
+                            print(f"Downloaded to {final_path}")
+                            downloaded_files += 1
                 except Exception as e:
                     print(f"Error downloading message ID {message.id}: {e}")
                     traceback.print_exc()
                     # 清理可能存在的临时文件
-                    temp_target_path = os.path.join(media_type_dir, f"{message.id}_temp")
+                    temp_target_path = os.path.join(media_type_dir, f"{file_prefix}temp")
                     if os.path.exists(temp_target_path):
                         try:
                             os.remove(temp_target_path)
