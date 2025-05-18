@@ -12,7 +12,21 @@ from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, MessageMediaPhoto, MessageMediaDocument, InputMessagesFilterEmpty
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio, DocumentAttributeFilename
 from telethon.tl.types import MessageMediaWebPage
+from telethon.errors import FloodWaitError, SecurityError, UnauthorizedError, BadRequestError
 import re
+import time
+import logging
+import random
+
+# 设置日志记录
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 全局变量，用于追踪连续错误和重试
+consecutive_errors = 0
+MAX_CONSECUTIVE_ERRORS = 5
+SESSION_FILENAME = 'telegram_session'
+SESSION_BACKUP_DIR = 'session_backups'
 
 # Load configuration from config.yml
 def load_config():
@@ -37,8 +51,103 @@ if not API_ID or not API_HASH or API_ID == 12345 or API_HASH == "your_api_hash_h
     print("Please update config.yml with your actual API ID and API Hash from https://my.telegram.org/")
     sys.exit(1)
 
-# Client setup
-client = TelegramClient('telegram_session', API_ID, API_HASH)
+# Client setup - modified to be a function so we can recreate it
+def create_client():
+    return TelegramClient(SESSION_FILENAME, API_ID, API_HASH)
+
+# Initial client instance
+client = create_client()
+
+# 添加会话备份和恢复函数
+def backup_session():
+    """备份当前会话文件"""
+    try:
+        # 确保备份目录存在
+        os.makedirs(SESSION_BACKUP_DIR, exist_ok=True)
+        
+        # 创建带时间戳的备份文件名
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"{SESSION_FILENAME}_{timestamp}"
+        backup_path = os.path.join(SESSION_BACKUP_DIR, backup_filename)
+        
+        # 复制会话文件
+        if os.path.exists(f"{SESSION_FILENAME}.session"):
+            import shutil
+            shutil.copy2(f"{SESSION_FILENAME}.session", f"{backup_path}.session")
+            logger.info(f"Successfully backed up session to {backup_path}.session")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to backup session: {e}")
+        return False
+    return False
+
+def reset_session():
+    """重置会话文件并创建新客户端"""
+    global client
+    
+    try:
+        # 先备份当前会话
+        backup_session()
+        
+        # 关闭当前客户端
+        if client and client.is_connected():
+            logger.info("Disconnecting current client...")
+            client.disconnect()
+        
+        # 重命名当前会话文件（如果存在）
+        session_file = f"{SESSION_FILENAME}.session"
+        if os.path.exists(session_file):
+            os.rename(session_file, f"{session_file}.old")
+            logger.info(f"Renamed current session file to {session_file}.old")
+        
+        # 创建新客户端
+        logger.info("Creating new client with fresh session...")
+        client = create_client()
+        
+        # 返回新创建的客户端
+        return client
+    except Exception as e:
+        logger.error(f"Error resetting session: {e}")
+        # 如果重置失败，尝试恢复原来的客户端
+        client = create_client()
+        return client
+
+async def handle_connection_error(e, retry_count=0, max_retries=3, retry_delay=5):
+    """处理连接错误，包括安全错误和未授权错误"""
+    global consecutive_errors, client
+    
+    logger.error(f"Connection error: {e}")
+    consecutive_errors += 1
+    
+    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS or isinstance(e, (SecurityError, UnauthorizedError)):
+        logger.warning(f"Too many consecutive errors ({consecutive_errors}) or critical error detected. Resetting session...")
+        # 重置会话
+        backup_session()
+        client = reset_session()
+        consecutive_errors = 0
+        
+        # 尝试重新连接
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.warning("Session reset, but user is not authorized. Need to login again.")
+                await qr_login()
+            else:
+                logger.info("Successfully reconnected after session reset.")
+            return True
+        except Exception as reconnect_error:
+            logger.error(f"Failed to reconnect after session reset: {reconnect_error}")
+            return False
+    
+    # 对于其他错误，如果重试次数未达到最大值，则等待后重试
+    if retry_count < max_retries:
+        retry_delay_with_jitter = retry_delay + (random.random() * 2)
+        logger.info(f"Retrying in {retry_delay_with_jitter:.2f} seconds (attempt {retry_count + 1}/{max_retries})...")
+        await asyncio.sleep(retry_delay_with_jitter)
+        return True
+    else:
+        logger.error(f"Failed after {max_retries} retries.")
+        return False
 
 # 添加一个全局字典来保存每个schedule文件对应的数据
 # 使用字典以支持多个任务并行处理时各自有独立的缓存
@@ -170,6 +279,8 @@ async def list_dialogs(limit=100):
     with appropriate offset values. The limit parameter controls how many dialogs
     are fetched in each request.
     """
+    global consecutive_errors
+    max_retries = 3  # 最大重试次数
     total_count = 0
     
     # For pagination
@@ -177,69 +288,95 @@ async def list_dialogs(limit=100):
     offset_id = 0
     offset_peer = InputPeerEmpty()
     
-    print(f"Fetching all dialogs (in batches of {limit})...")
-    print("\nDialogs:")
+    logger.info(f"Fetching all dialogs (in batches of {limit})...")
+    logger.info("\nDialogs:")
     
     while True:
-        try:
-            result = await client(GetDialogsRequest(
-                offset_date=offset_date,
-                offset_id=offset_id,
-                offset_peer=offset_peer,
-                limit=limit,
-                hash=0
-            ))
-            
-            # If no dialogs returned, we've reached the end
-            if not result.dialogs:
-                print("No more dialogs found.")
-                break
+        retry_count = 0
+        success = False
+        
+        while retry_count < max_retries and not success:
+            try:
+                result = await client(GetDialogsRequest(
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_peer=offset_peer,
+                    limit=limit,
+                    hash=0
+                ))
                 
-            # Process and display each dialog immediately
-            for dialog in result.dialogs:
-                try:
-                    entity = await client.get_entity(dialog.peer)
-                    name = getattr(entity, 'title', getattr(entity, 'first_name', ''))
-                    print(f"ID: {entity.id} - Name: {name}")
-                    total_count += 1
-                except Exception as e:
-                    print(f"Error getting entity: {e}")
-            
-            print(f"Fetched {len(result.dialogs)} more dialogs. Total so far: {total_count}")
-            
-            # If we got fewer dialogs than requested, we've reached the end
-            if len(result.dialogs) < limit:
-                print("Reached the end of the dialog list.")
-                break
+                # 重置连续错误计数
+                consecutive_errors = 0
+                success = True
                 
-            # Update offset for next iteration - use the last dialog as reference
-            last_dialog = result.dialogs[-1]
-            last_message = None
-            
-            # Find the message corresponding to the last dialog
-            for message in result.messages:
-                if message.peer_id == last_dialog.peer:
-                    last_message = message
-                    break
-            
-            if last_message:
-                offset_date = last_message.date
-                offset_id = last_message.id
-            else:
-                # Fallback if we can't find the corresponding message
-                offset_id = last_dialog.top_message
+                # If no dialogs returned, we've reached the end
+                if not result.dialogs:
+                    logger.info("No more dialogs found.")
+                    return
+                    
+                # Process and display each dialog immediately
+                for dialog in result.dialogs:
+                    try:
+                        entity = await client.get_entity(dialog.peer)
+                        name = getattr(entity, 'title', getattr(entity, 'first_name', ''))
+                        logger.info(f"ID: {entity.id} - Name: {name}")
+                        total_count += 1
+                    except Exception as e:
+                        logger.error(f"Error getting entity: {e}")
                 
-            offset_peer = last_dialog.peer
-            
-            # Add a small delay to avoid hitting rate limits
-            await asyncio.sleep(0.5)
-            
-        except Exception as e:
-            print(f"Error fetching dialogs: {e}")
-            traceback.print_exc()
-            break
+                logger.info(f"Fetched {len(result.dialogs)} more dialogs. Total so far: {total_count}")
+                
+                # If we got fewer dialogs than requested, we've reached the end
+                if len(result.dialogs) < limit:
+                    logger.info("Reached the end of the dialog list.")
+                    return
+                    
+                # Update offset for next iteration - use the last dialog as reference
+                last_dialog = result.dialogs[-1]
+                last_message = None
+                
+                # Find the message corresponding to the last dialog
+                for message in result.messages:
+                    if message.peer_id == last_dialog.peer:
+                        last_message = message
+                        break
+                
+                if last_message:
+                    offset_date = last_message.date
+                    offset_id = last_message.id
+                else:
+                    # Fallback if we can't find the corresponding message
+                    offset_id = last_dialog.top_message
+                    
+                offset_peer = last_dialog.peer
+                
+                # Add a small delay to avoid hitting rate limits
+                await asyncio.sleep(0.5)
+                
+            except SecurityError as e:
+                consecutive_errors += 1
+                logger.error(f"Security error fetching dialogs: {e}")
+                
+                # 处理安全错误
+                if await handle_connection_error(e, retry_count, max_retries):
+                    retry_count += 1
+                    continue
+                else:
+                    logger.error("Failed to recover from security error after multiple retries")
+                    return
+            except Exception as e:
+                logger.error(f"Error fetching dialogs: {e}")
+                traceback.print_exc()
+                
+                retry_count += 1
+                if retry_count < max_retries:
+                    # 指数退避
+                    await asyncio.sleep(2 * retry_count)
+                else:
+                    logger.error(f"Failed to fetch dialogs after {max_retries} retries. Stopping.")
+                    return
     
-    print(f"\nFound {total_count} dialogs in total.")
+    logger.info(f"\nFound {total_count} dialogs in total.")
 
 # 添加文件哈希计算函数
 # def calculate_file_hash(file_path):
@@ -254,82 +391,107 @@ async def list_dialogs(limit=100):
 # 添加一个函数来处理消息中的所有媒体文件
 async def download_all_media_from_message(message, channel_dir, temp_dir_prefix):
     """Download all media files from a message, including albums"""
+    global consecutive_errors
+    max_retries = 3  # 最大重试次数
     downloaded_files = []
     media_count = 0
     
-    # 检查消息是否有媒体
-    if not message.media:
-        return downloaded_files, media_count
-    
-    # 如果是网页预览，跳过
-    if isinstance(message.media, MessageMediaWebPage):
-        return downloaded_files, media_count
-    
-    # 获取消息类型
-    message_type = get_message_type(message).lower()
-    
-    # 确定目标目录
-    target_dir = os.path.join(channel_dir, message_type)
-    os.makedirs(target_dir, exist_ok=True)
-    
-    # 处理主媒体文件
-    if message.media:
-        # 生成一个唯一的文件名前缀
-        file_prefix = f"{message.id}_"
+    try:
+        # 检查消息是否有媒体
+        if not message.media:
+            return downloaded_files, media_count
         
-        # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
-        # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
-        existing_files = [f for f in os.listdir(target_dir) 
-                         if f.startswith(file_prefix) and "temp" not in f]
+        # 如果是网页预览，跳过
+        if isinstance(message.media, MessageMediaWebPage):
+            return downloaded_files, media_count
         
-        # 清理可能存在的临时文件（未完成的下载）
-        # 修复：查找所有包含"temp"的文件
-        temp_files = [f for f in os.listdir(target_dir) 
-                     if f.startswith(file_prefix) and "temp" in f]
-        for temp_file in temp_files:
-            try:
-                os.remove(os.path.join(target_dir, temp_file))
-                print(f"Removed incomplete download: {temp_file}")
-            except Exception as e:
-                print(f"Error removing temporary file {temp_file}: {e}")
+        # 获取消息类型
+        message_type = get_message_type(message).lower()
         
-        if existing_files:
-            # 文件已存在，跳过下载
-            existing_file = existing_files[0]  # 取第一个匹配的文件
-            existing_path = os.path.join(target_dir, existing_file)
-            print(f"Complete file already exists: {existing_path} - Skipping download")
-            downloaded_files.append(existing_path)
-            media_count += 1
-        else:
-            # 文件不存在或只有临时文件，进行下载
-            media_count += 1
+        # 确定目标目录
+        target_dir = os.path.join(channel_dir, message_type)
+        os.makedirs(target_dir, exist_ok=True)
+        
+        # 处理主媒体文件
+        if message.media:
+            # 生成一个唯一的文件名前缀
+            file_prefix = f"{message.id}_"
             
-            try:
-                # 直接下载到目标目录，使用临时文件名
-                temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
-                downloaded_path = await client.download_media(message, temp_target_path)
+            # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
+            # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
+            existing_files = [f for f in os.listdir(target_dir) 
+                             if f.startswith(file_prefix) and "temp" not in f]
+            
+            # 清理可能存在的临时文件（未完成的下载）
+            # 修复：查找所有包含"temp"的文件
+            temp_files = [f for f in os.listdir(target_dir) 
+                         if f.startswith(file_prefix) and "temp" in f]
+            for temp_file in temp_files:
+                try:
+                    os.remove(os.path.join(target_dir, temp_file))
+                    logger.info(f"Removed incomplete download: {temp_file}")
+                except Exception as e:
+                    logger.error(f"Error removing temporary file {temp_file}: {e}")
+            
+            if existing_files:
+                # 文件已存在，跳过下载
+                existing_file = existing_files[0]  # 取第一个匹配的文件
+                existing_path = os.path.join(target_dir, existing_file)
+                logger.info(f"Complete file already exists: {existing_path} - Skipping download")
+                downloaded_files.append(existing_path)
+                media_count += 1
+            else:
+                # 文件不存在或只有临时文件，进行下载
+                media_count += 1
                 
-                if downloaded_path:
-                    # 计算文件哈希值
-                    # file_hash = calculate_file_hash(downloaded_path)
-                    file_hash = "nohash"
-                    
-                    # 获取文件扩展名
-                    _, file_extension = os.path.splitext(downloaded_path)
-                    if not file_extension:
-                        file_extension = '.bin'
-                    
-                    # 创建最终文件名，使用哈希值
-                    final_path = os.path.join(target_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
-                    
-                    # 重命名文件到最终名称
-                    os.rename(downloaded_path, final_path)
-                    
-                    print(f"Downloaded media to {final_path}")
-                    downloaded_files.append(final_path)
-            except Exception as e:
-                print(f"Error downloading main media from message ID {message.id}: {e}")
-                traceback.print_exc()
+                # 添加重试机制
+                for retry_count in range(max_retries):
+                    try:
+                        # 直接下载到目标目录，使用临时文件名
+                        temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
+                        downloaded_path = await client.download_media(message, temp_target_path)
+                        
+                        if downloaded_path:
+                            # 计算文件哈希值
+                            # file_hash = calculate_file_hash(downloaded_path)
+                            file_hash = "nohash"
+                            
+                            # 获取文件扩展名
+                            _, file_extension = os.path.splitext(downloaded_path)
+                            if not file_extension:
+                                file_extension = '.bin'
+                            
+                            # 创建最终文件名，使用哈希值
+                            final_path = os.path.join(target_dir, f"{file_prefix}{file_hash[:16]}{file_extension}")
+                            
+                            # 重命名文件到最终名称
+                            os.rename(downloaded_path, final_path)
+                            
+                            logger.info(f"Downloaded media to {final_path}")
+                            downloaded_files.append(final_path)
+                            consecutive_errors = 0  # 重置连续错误计数
+                            break  # 成功下载，跳出重试循环
+                        else:
+                            logger.warning(f"Failed to download media from message ID {message.id} (attempt {retry_count + 1})")
+                            if retry_count < max_retries - 1:
+                                await asyncio.sleep(1 + retry_count)  # 指数退避
+                    except SecurityError as e:
+                        consecutive_errors += 1
+                        logger.error(f"Security error downloading media from message ID {message.id}: {e}")
+                        # 如果是安全错误，尝试重置会话
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                            logger.warning(f"Too many consecutive security errors ({consecutive_errors}), resetting session...")
+                            await handle_connection_error(e, retry_count, max_retries)
+                        # 如果不是最后一次重试，等待后继续
+                        if retry_count < max_retries - 1:
+                            await asyncio.sleep(2 * (retry_count + 1))
+                    except Exception as e:
+                        logger.error(f"Error downloading media from message ID {message.id} (attempt {retry_count + 1}): {e}")
+                        traceback.print_exc()
+                        # 如果不是最后一次重试，等待后继续
+                        if retry_count < max_retries - 1:
+                            await asyncio.sleep(1 + retry_count)  # 指数退避
+                            
                 # 清理可能存在的临时文件
                 temp_target_path = os.path.join(target_dir, f"{file_prefix}temp")
                 if os.path.exists(temp_target_path):
@@ -337,82 +499,104 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                         os.remove(temp_target_path)
                     except:
                         pass
-    
-    # 处理消息中的多媒体内容 - 改进版
-    if hasattr(message, 'media') and hasattr(message.media, 'document'):
-        # 检查是否有多个媒体 (检查document中的attributes)
-        try:
-            # 对于包含多个图片的消息，Telegram通常会将它们作为document中的属性保存
-            # 我们需要遍历这些属性，查找表示多个媒体的特征
-            
-            # 检查文档是否有GroupedMedia属性
-            has_grouped_media = False
-            
-            # 获取文档的MIME类型
-            mime_type = message.media.document.mime_type if hasattr(message.media.document, 'mime_type') else ''
-            
-            # 检查文档是否有对应多媒体的属性
-            for attribute in message.media.document.attributes:
-                if hasattr(attribute, 'file_name') and attribute.file_name:
-                    # 可能是包含多个媒体的文件
-                    if mime_type.startswith('image/'): # or mime_type.startswith('video/'):
-                        has_grouped_media = True
-                        break
-            
-            if has_grouped_media:
-                # 生成一个唯一的文件名前缀
-                grouped_prefix = f"{message.id}_grouped_"
+        
+        # 处理消息中的多媒体内容 - 改进版
+        if hasattr(message, 'media') and hasattr(message.media, 'document'):
+            # 检查是否有多个媒体 (检查document中的attributes)
+            try:
+                # 对于包含多个图片的消息，Telegram通常会将它们作为document中的属性保存
+                # 我们需要遍历这些属性，查找表示多个媒体的特征
                 
-                # 检查目标目录中是否已经存在以该前缀开头的文件
-                # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
-                existing_grouped_files = [f for f in os.listdir(target_dir) 
-                                         if f.startswith(grouped_prefix) and "temp" not in f]
+                # 检查文档是否有GroupedMedia属性
+                has_grouped_media = False
                 
-                # 清理可能存在的临时文件（未完成的下载）
-                # 修复：查找所有包含"temp"的文件
-                grouped_temp_files = [f for f in os.listdir(target_dir) 
-                                     if f.startswith(grouped_prefix) and "temp" in f]
-                for grouped_temp_file in grouped_temp_files:
-                    try:
-                        os.remove(os.path.join(target_dir, grouped_temp_file))
-                        print(f"Removed incomplete grouped download: {grouped_temp_file}")
-                    except Exception as e:
-                        print(f"Error removing temporary grouped file {grouped_temp_file}: {e}")
+                # 获取文档的MIME类型
+                mime_type = message.media.document.mime_type if hasattr(message.media.document, 'mime_type') else ''
                 
-                if existing_grouped_files:
-                    # 文件已存在，跳过下载
-                    existing_grouped_file = existing_grouped_files[0]  # 取第一个匹配的文件
-                    existing_grouped_path = os.path.join(target_dir, existing_grouped_file)
-                    print(f"Complete grouped file already exists: {existing_grouped_path} - Skipping download")
-                    downloaded_files.append(existing_grouped_path)
-                    media_count += 1
-                else:
-                    # 文件不存在或只有临时文件，进行下载
-                    try:
-                        grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
-                        grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_target_path)
-                        
-                        if grouped_downloaded_path:
-                            # grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
-                            grouped_file_hash = "nohash"
-                            
-                            _, grouped_file_extension = os.path.splitext(grouped_downloaded_path)
-                            if not grouped_file_extension:
-                                grouped_file_extension = '.bin'
-                            
-                            grouped_final_path = os.path.join(
-                                target_dir, 
-                                f"{grouped_prefix}{grouped_file_hash[:16]}{grouped_file_extension}"
-                            )
-                            
-                            os.rename(grouped_downloaded_path, grouped_final_path)
-                            
-                            print(f"Downloaded grouped media to {grouped_final_path}")
-                            downloaded_files.append(grouped_final_path)
-                            media_count += 1
-                    except Exception as e:
-                        print(f"Error downloading grouped media from message ID {message.id}: {e}")
-                        traceback.print_exc()
+                # 检查文档是否有对应多媒体的属性
+                for attribute in message.media.document.attributes:
+                    if hasattr(attribute, 'file_name') and attribute.file_name:
+                        # 可能是包含多个媒体的文件
+                        if mime_type.startswith('image/'): # or mime_type.startswith('video/'):
+                            has_grouped_media = True
+                            break
+                
+                if has_grouped_media:
+                    # 生成一个唯一的文件名前缀
+                    grouped_prefix = f"{message.id}_grouped_"
+                    
+                    # 检查目标目录中是否已经存在以该前缀开头的文件
+                    # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
+                    existing_grouped_files = [f for f in os.listdir(target_dir) 
+                                             if f.startswith(grouped_prefix) and "temp" not in f]
+                    
+                    # 清理可能存在的临时文件（未完成的下载）
+                    # 修复：查找所有包含"temp"的文件
+                    grouped_temp_files = [f for f in os.listdir(target_dir) 
+                                         if f.startswith(grouped_prefix) and "temp" in f]
+                    for grouped_temp_file in grouped_temp_files:
+                        try:
+                            os.remove(os.path.join(target_dir, grouped_temp_file))
+                            logger.info(f"Removed incomplete grouped download: {grouped_temp_file}")
+                        except Exception as e:
+                            logger.error(f"Error removing temporary grouped file {grouped_temp_file}: {e}")
+                    
+                    if existing_grouped_files:
+                        # 文件已存在，跳过下载
+                        existing_grouped_file = existing_grouped_files[0]  # 取第一个匹配的文件
+                        existing_grouped_path = os.path.join(target_dir, existing_grouped_file)
+                        logger.info(f"Complete grouped file already exists: {existing_grouped_path} - Skipping download")
+                        downloaded_files.append(existing_grouped_path)
+                        media_count += 1
+                    else:
+                        # 文件不存在或只有临时文件，进行下载
+                        # 添加重试机制
+                        for retry_count in range(max_retries):
+                            try:
+                                grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
+                                grouped_downloaded_path = await client.download_media(message.media.document, grouped_temp_target_path)
+                                
+                                if grouped_downloaded_path:
+                                    # grouped_file_hash = calculate_file_hash(grouped_downloaded_path)
+                                    grouped_file_hash = "nohash"
+                                    
+                                    _, grouped_file_extension = os.path.splitext(grouped_downloaded_path)
+                                    if not grouped_file_extension:
+                                        grouped_file_extension = '.bin'
+                                    
+                                    grouped_final_path = os.path.join(
+                                        target_dir, 
+                                        f"{grouped_prefix}{grouped_file_hash[:16]}{grouped_file_extension}"
+                                    )
+                                    
+                                    os.rename(grouped_downloaded_path, grouped_final_path)
+                                    
+                                    logger.info(f"Downloaded grouped media to {grouped_final_path}")
+                                    downloaded_files.append(grouped_final_path)
+                                    media_count += 1
+                                    consecutive_errors = 0  # 重置连续错误计数
+                                    break  # 成功下载，跳出重试循环
+                                else:
+                                    logger.warning(f"Failed to download grouped media from message ID {message.id} (attempt {retry_count + 1})")
+                                    if retry_count < max_retries - 1:
+                                        await asyncio.sleep(1 + retry_count)  # 指数退避
+                            except SecurityError as e:
+                                consecutive_errors += 1
+                                logger.error(f"Security error downloading grouped media from message ID {message.id}: {e}")
+                                # 如果是安全错误，尝试重置会话
+                                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                                    logger.warning(f"Too many consecutive security errors ({consecutive_errors}), resetting session...")
+                                    await handle_connection_error(e, retry_count, max_retries)
+                                # 如果不是最后一次重试，等待后继续
+                                if retry_count < max_retries - 1:
+                                    await asyncio.sleep(2 * (retry_count + 1))
+                            except Exception as e:
+                                logger.error(f"Error downloading grouped media from message ID {message.id} (attempt {retry_count + 1}): {e}")
+                                traceback.print_exc()
+                                # 如果不是最后一次重试，等待后继续
+                                if retry_count < max_retries - 1:
+                                    await asyncio.sleep(1 + retry_count)  # 指数退避
+                                    
                         # 清理可能存在的临时文件
                         grouped_temp_target_path = os.path.join(target_dir, f"{grouped_prefix}temp")
                         if os.path.exists(grouped_temp_target_path):
@@ -421,42 +605,68 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                             except:
                                 pass
                  
-        except Exception as e:
-            print(f"Error checking for grouped media in message ID {message.id}: {e}")
-            traceback.print_exc()
-    
-    # 不再在这里处理相册的其他消息，因为这个操作已移至process_single_channel函数中
-    # 这样避免了重复处理相册，提高了效率
-    
-    return downloaded_files, media_count
+            except Exception as e:
+                logger.error(f"Error checking for grouped media in message ID {message.id}: {e}")
+                traceback.print_exc()
+        
+        return downloaded_files, media_count
+        
+    except SecurityError as e:
+        consecutive_errors += 1
+        logger.error(f"Security error in download_all_media_from_message for message ID {message.id if hasattr(message, 'id') else 'unknown'}: {e}")
+        # 如果是安全错误，尝试处理它
+        await handle_connection_error(e)
+        return downloaded_files, media_count
+    except Exception as e:
+        logger.error(f"Error in download_all_media_from_message for message ID {message.id if hasattr(message, 'id') else 'unknown'}: {e}")
+        traceback.print_exc()
+        return downloaded_files, media_count
 
 # 添加一个函数来检查消息是否是相册，并获取相册信息
 async def get_message_info(message):
     """获取消息的详细信息，包括类型和相册信息"""
-    message_type = get_message_type(message).lower()
-    is_album = hasattr(message, 'grouped_id') and message.grouped_id is not None
-    album_size = 0
-    
-    # 如果是相册，尝试获取相册大小
-    if is_album:
-        try:
-            # 获取相册ID
-            album_id = message.grouped_id
-            # 尝试获取相册中的消息数量
-            # 注意：这里不直接获取消息内容，只是尝试获取数量信息
-            # 由于之前的错误，我们不使用client.get_messages(ids=album_id)
-            # 相册消息通常在时间上接近，可以尝试获取时间范围内的消息
-            # 这只是一个估计，可能不准确
-            album_size = "未知"  # 默认值
-        except Exception as e:
-            print(f"Error getting album info for message ID {message.id}: {e}")
-    
-    return {
-        "type": message_type,
-        "is_album": is_album,
-        "album_id": message.grouped_id if is_album else None,
-        "album_size": album_size
-    }
+    global consecutive_errors
+    try:
+        message_type = get_message_type(message).lower()
+        is_album = hasattr(message, 'grouped_id') and message.grouped_id is not None
+        album_size = 0
+        
+        # 如果是相册，尝试获取相册大小
+        if is_album:
+            try:
+                # 获取相册ID
+                album_id = message.grouped_id
+                # 尝试获取相册中的消息数量
+                # 注意：这里不直接获取消息内容，只是尝试获取数量信息
+                # 由于之前的错误，我们不使用client.get_messages(ids=album_id)
+                # 相册消息通常在时间上接近，可以尝试获取时间范围内的消息
+                # 这只是一个估计，可能不准确
+                album_size = "未知"  # 默认值
+            except SecurityError as e:
+                # 安全错误，增加连续错误计数
+                consecutive_errors += 1
+                logger.error(f"Security error getting album info for message ID {message.id}: {e}")
+                # 不抛出异常，继续使用已知信息
+            except Exception as e:
+                logger.error(f"Error getting album info for message ID {message.id}: {e}")
+        
+        consecutive_errors = 0  # 成功完成，重置连续错误计数
+        
+        return {
+            "type": message_type,
+            "is_album": is_album,
+            "album_id": message.grouped_id if is_album else None,
+            "album_size": album_size
+        }
+    except Exception as e:
+        logger.error(f"Error in get_message_info for message ID {message.id if hasattr(message, 'id') else 'unknown'}: {e}")
+        # 返回默认信息以避免中断处理流程
+        return {
+            "type": "unknown",
+            "is_album": False,
+            "album_id": None,
+            "album_size": 0
+        }
 
 async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500):
     """Download media from a specified task file"""
@@ -576,6 +786,7 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
 # 添加一个新函数处理单个频道的下载
 async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=500, msg_limit=500, allowed_types=None):
     """处理单个频道的下载任务"""
+    global consecutive_errors
     try:
         # 获取输出目录
         if not output_dir:
@@ -583,8 +794,34 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
         
         # 处理频道名称作为子目录
         try:
-            entity = await client.get_entity(channel_id)
-            print(f"Found entity: {entity.title if hasattr(entity, 'title') else channel_id}")
+            # 重试获取实体的机制
+            retry_count = 0
+            max_retries = 3
+            entity = None
+            
+            while retry_count < max_retries:
+                try:
+                    entity = await client.get_entity(channel_id)
+                    consecutive_errors = 0  # 重置连续错误计数
+                    logger.info(f"Found entity: {entity.title if hasattr(entity, 'title') else channel_id}")
+                    break
+                except (SecurityError, UnauthorizedError) as e:
+                    logger.error(f"Security or auth error while getting entity: {e}")
+                    if await handle_connection_error(e, retry_count, max_retries):
+                        retry_count += 1
+                        continue
+                    else:
+                        raise
+                except Exception as e:
+                    logger.error(f"Error getting entity: {e}")
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        await asyncio.sleep(2 * retry_count)  # 指数退避
+                    else:
+                        raise
+            
+            if not entity:
+                raise Exception(f"Failed to get entity for channel ID {channel_id} after {max_retries} retries")
             
             # 如果未提供名称，则使用实体标题
             if not channel_name and hasattr(entity, 'title'):
@@ -603,7 +840,7 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                 os.makedirs(media_dir, exist_ok=True)
             
             # 获取频道的所有消息
-            print(f"Downloading media from {channel_name} ({channel_id})")
+            logger.info(f"Downloading media from {channel_name} ({channel_id})")
             
             # 计算批处理大小
             batch_size = 100  # 默认批处理大小
@@ -613,37 +850,92 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             latest_message_id = 0
             
             try:
-                # 获取频道的第一条（最早）消息
-                first_messages = await client.get_messages(entity, limit=1, reverse=True)
-                if first_messages and len(first_messages) > 0:
-                    first_message_id = first_messages[0].id
-                    print(f"First message ID: {first_message_id}")
+                # 获取频道的第一条（最早）消息 - 添加重试机制
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        first_messages = await client.get_messages(entity, limit=1, reverse=True)
+                        consecutive_errors = 0  # 重置连续错误计数
+                        if first_messages and len(first_messages) > 0:
+                            first_message_id = first_messages[0].id
+                            logger.info(f"First message ID: {first_message_id}")
+                        break
+                    except (SecurityError, UnauthorizedError) as e:
+                        logger.error(f"Security error getting first message: {e}")
+                        if await handle_connection_error(e, retry_count, max_retries):
+                            retry_count += 1
+                            continue
+                        else:
+                            raise
+                    except Exception as e:
+                        logger.error(f"Error getting first message: {e}")
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            await asyncio.sleep(2 * retry_count)
+                        else:
+                            raise
                 
-                # 获取频道的最新消息
-                latest_messages = await client.get_messages(entity, limit=1)
-                if latest_messages and len(latest_messages) > 0:
-                    latest_message_id = latest_messages[0].id
-                    print(f"Latest message ID: {latest_message_id}")
+                # 获取频道的最新消息 - 添加重试机制
+                retry_count = 0
+                while retry_count < max_retries:
+                    try:
+                        latest_messages = await client.get_messages(entity, limit=1)
+                        consecutive_errors = 0  # 重置连续错误计数
+                        if latest_messages and len(latest_messages) > 0:
+                            latest_message_id = latest_messages[0].id
+                            logger.info(f"Latest message ID: {latest_message_id}")
+                        break
+                    except (SecurityError, UnauthorizedError) as e:
+                        logger.error(f"Security error getting latest message: {e}")
+                        if await handle_connection_error(e, retry_count, max_retries):
+                            retry_count += 1
+                            continue
+                        else:
+                            raise
+                    except Exception as e:
+                        logger.error(f"Error getting latest message: {e}")
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            await asyncio.sleep(2 * retry_count)
+                        else:
+                            raise
                 
                 # 计算总消息数的估计值
                 # 注意：实际消息数可能少于此估计值，因为消息ID可能不连续
                 total_messages = latest_message_id - first_message_id + 1
-                print(f"Estimated total messages (based on ID range): {total_messages}")
+                logger.info(f"Estimated total messages (based on ID range): {total_messages}")
                 
                 # 使用更简单的方法尝试获取消息数量
                 try:
                     # 使用client.get_messages的limit=0参数获取总消息数
-                    message_count = await client.get_messages(entity, limit=0)
-                    if hasattr(message_count, 'total'):
-                        print(f"Actual message count: {message_count.total}")
-                        # 更新total_messages为实际值
-                        total_messages = message_count.total
+                    retry_count = 0
+                    message_count = None
+                    
+                    while retry_count < max_retries and message_count is None:
+                        try:
+                            message_count = await client.get_messages(entity, limit=0)
+                            consecutive_errors = 0  # 重置连续错误计数
+                            if hasattr(message_count, 'total'):
+                                logger.info(f"Actual message count: {message_count.total}")
+                                # 更新total_messages为实际值
+                                total_messages = message_count.total
+                        except (SecurityError, UnauthorizedError) as e:
+                            logger.error(f"Security error getting message count: {e}")
+                            if await handle_connection_error(e, retry_count, max_retries):
+                                retry_count += 1
+                                continue
+                            else:
+                                break
+                        except Exception as e:
+                            logger.error(f"Note: Could not get exact message count: {e}")
+                            # 这里不是关键错误，继续使用估计值
+                            break
                 except Exception as e:
-                    print(f"Note: Could not get exact message count: {e}")
+                    logger.error(f"Error with message count: {e}")
                     # 这里不是关键错误，继续使用估计值
                     pass
             except Exception as e:
-                print(f"Error getting message range: {e}")
+                logger.error(f"Error getting message range: {e}")
                 total_messages = None
                 traceback.print_exc()
             
@@ -656,14 +948,14 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             # 如果有上次的进度，从上次位置继续；否则从第一条消息开始
             if last_message_id and last_message_id > first_message_id:
                 current_id = last_message_id + 1  # 从下一条消息开始
-                print(f"Resuming from message ID: {current_id}")
+                logger.info(f"Resuming from message ID: {current_id}")
             else:
                 current_id = first_message_id  # 从第一条消息开始
-                print(f"Starting from the first message (ID: {current_id})")
+                logger.info(f"Starting from the first message (ID: {current_id})")
             
             # 如果无法确定起始ID，则退出
             if current_id == 0:
-                print("Could not determine a valid starting message ID")
+                logger.warning("Could not determine a valid starting message ID")
                 return
             
             # 初始化变量
@@ -687,16 +979,16 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             if total_messages is not None and current_id <= latest_message_id:
                 # 计算还需要处理的消息数
                 messages_to_process = latest_message_id - current_id + 1
-                print(f"Estimated messages to process: {messages_to_process}")
+                logger.info(f"Estimated messages to process: {messages_to_process}")
                 
                 # 如果设置了消息限制，取较小值
                 if msg_limit > 0:
                     messages_to_process = min(messages_to_process, msg_limit)
-                    print(f"Limited to {messages_to_process} messages due to limit setting")
+                    logger.info(f"Limited to {messages_to_process} messages due to limit setting")
                 
                 # 计算总批次数
                 total_batches = (messages_to_process + batch_size - 1) // batch_size if messages_to_process > 0 else 0
-                print(f"Estimated total batches: {total_batches}")
+                logger.info(f"Estimated total batches: {total_batches}")
             
             # 追踪处理的消息计数
             processed_count = 0
@@ -706,11 +998,11 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                 # 显示当前批次和总批次
                 if total_batches:
                     progress_percent = min(100.0, (batch_number / total_batches * 100))
-                    print(f"Processing batch {batch_number}/{total_batches} ({progress_percent:.1f}%)")
+                    logger.info(f"Processing batch {batch_number}/{total_batches} ({progress_percent:.1f}%)")
                 else:
-                    print(f"Processing batch #{batch_number}")
+                    logger.info(f"Processing batch #{batch_number}")
                 
-                print(f"Processing messages from ID: {current_id} to approximately {min(current_id + batch_size - 1, max_id_to_process)}")
+                logger.info(f"Processing messages from ID: {current_id} to approximately {min(current_id + batch_size - 1, max_id_to_process)}")
                 
                 try:
                     # 获取一批消息 - 使用min_id和max_id参数来指定ID范围
@@ -718,22 +1010,48 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                     min_id = current_id
                     max_id = min(current_id + batch_size - 1, max_id_to_process)
                     
-                    messages = await client.get_messages(
-                        entity,
-                        limit=batch_size,
-                        min_id=min_id - 1,  # min_id是包含的，所以减1来确保包含current_id
-                        max_id=max_id       # max_id是包含的
-                    )
+                    # 添加重试机制获取消息
+                    retry_count = 0
+                    messages = None
+                    
+                    while retry_count < max_retries and messages is None:
+                        try:
+                            messages = await client.get_messages(
+                                entity,
+                                limit=batch_size,
+                                min_id=min_id - 1,  # min_id是包含的，所以减1来确保包含current_id
+                                max_id=max_id       # max_id是包含的
+                            )
+                            consecutive_errors = 0  # 成功获取消息，重置连续错误计数
+                        except (SecurityError, UnauthorizedError) as e:
+                            logger.error(f"Security error getting messages {min_id}-{max_id}: {e}")
+                            if await handle_connection_error(e, retry_count, max_retries):
+                                retry_count += 1
+                                continue
+                            else:
+                                # 如果重试失败，尝试跳过当前批次
+                                logger.warning(f"Skipping batch {min_id}-{max_id} after repeated errors")
+                                messages = []
+                                break
+                        except Exception as e:
+                            logger.error(f"Error getting messages {min_id}-{max_id}: {e}")
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                await asyncio.sleep(2 * retry_count)  # 指数退避
+                            else:
+                                # 如果重试失败，尝试跳过当前批次
+                                logger.warning(f"Skipping batch {min_id}-{max_id} after {max_retries} retries")
+                                messages = []
                     
                     if not messages or len(messages) == 0:
-                        print(f"No messages found in range {min_id} to {max_id}")
+                        logger.info(f"No messages found in range {min_id} to {max_id}")
                         # 继续下一个批次
                         current_id = max_id + 1
                         batch_number += 1
                         
                         # 如果已经达到或超过最大ID，则退出循环
                         if current_id > max_id_to_process:
-                            print("Reached the end of message range")
+                            logger.info("Reached the end of message range")
                             has_more_messages = False
                         
                         continue
@@ -741,19 +1059,19 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                     # 确保消息按ID排序（从小到大，即时间从早到晚）
                     messages = sorted(messages, key=lambda m: m.id)
                     
-                    print(f"Retrieved {len(messages)} messages in this batch (ID range: {messages[0].id} to {messages[-1].id})")
+                    logger.info(f"Retrieved {len(messages)} messages in this batch (ID range: {messages[0].id} to {messages[-1].id})")
                     
                     # 处理这批消息
                     for message in messages:
-                        print(f"Processing message ID: {message.id}")
+                        logger.info(f"Processing message ID: {message.id}")
                         # 如果消息已经处理过，跳过
                         if message.id in processed_messages:
-                            print(f"Skipping already processed message ID {message.id}")
+                            logger.info(f"Skipping already processed message ID {message.id}")
                             continue
                         
                         # 如果消息已经作为相册的一部分被处理过，也跳过
                         if message.id in processed_album_message_ids:
-                            print(f"Skipping message ID {message.id} - already processed as part of an album")
+                            logger.info(f"Skipping message ID {message.id} - already processed as part of an album")
                             processed_messages.add(message.id)
                             processed_count += 1
                             # 更新进度（同时更新内存和文件）
@@ -764,16 +1082,39 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                         processed_messages.add(message.id)
                         processed_count += 1
                         
-                        # 获取消息详细信息
-                        message_info = await get_message_info(message)
+                        # 获取消息详细信息 - 添加重试机制
+                        retry_count = 0
+                        message_info = None
+                        
+                        while retry_count < max_retries and message_info is None:
+                            try:
+                                message_info = await get_message_info(message)
+                                consecutive_errors = 0  # 重置连续错误计数
+                            except (SecurityError, UnauthorizedError) as e:
+                                logger.error(f"Security error getting message info for ID {message.id}: {e}")
+                                if await handle_connection_error(e, retry_count, max_retries):
+                                    retry_count += 1
+                                    continue
+                                else:
+                                    # 如果重试失败，使用默认值
+                                    message_info = {"type": "unknown", "is_album": False}
+                                    break
+                            except Exception as e:
+                                logger.error(f"Error getting message info for ID {message.id}: {e}")
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    await asyncio.sleep(2 * retry_count)
+                                else:
+                                    # 如果重试失败，使用默认值
+                                    message_info = {"type": "unknown", "is_album": False}
+                        
                         message_type = message_info["type"]
-
-                        print(f"Message type: {message_type}")
+                        logger.info(f"Message type: {message_type}")
                         
                         # 检查当前消息类型是否在允许下载的类型列表中
                         # 如果不在allowed_types中且不是"all"，则跳过此消息
                         if "all" not in allowed_types and message_type not in allowed_types:
-                            print(f"Skipping message ID {message.id} of type {message_type} (not in allowed types: {', '.join(allowed_types)})")
+                            logger.info(f"Skipping message ID {message.id} of type {message_type} (not in allowed types: {', '.join(allowed_types)})")
                             # 更新进度（同时更新内存和文件）
                             update_last_message_id(schedule_file, message.id)
                             continue
@@ -788,26 +1129,49 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                         # 如果是相册消息并且这个相册还没有处理过，提前获取整个相册
                         if is_album and album_id and album_id not in processed_albums:
                             processed_albums.add(album_id)
-                            print(f"Processing album {album_id} for the first time")
+                            logger.info(f"Processing album {album_id} for the first time")
                             
                             # 获取相册中的所有消息
                             try:
                                 # 获取消息所在的会话
                                 chat_entity = message.chat if hasattr(message, 'chat') else message.peer_id
                                 
-                                # 获取消息ID附近的消息
-                                album_messages = await client.get_messages(
-                                    entity=chat_entity,
-                                    offset_id=message.id,
-                                    limit=100  # 增加限制以获取更多可能的相册消息
-                                )
+                                # 获取消息ID附近的消息 - 添加重试机制
+                                retry_count = 0
+                                album_messages = None
+                                
+                                while retry_count < max_retries and album_messages is None:
+                                    try:
+                                        album_messages = await client.get_messages(
+                                            entity=chat_entity,
+                                            offset_id=message.id,
+                                            limit=100  # 增加限制以获取更多可能的相册消息
+                                        )
+                                        consecutive_errors = 0  # 重置连续错误计数
+                                    except (SecurityError, UnauthorizedError) as e:
+                                        logger.error(f"Security error getting album messages for album {album_id}: {e}")
+                                        if await handle_connection_error(e, retry_count, max_retries):
+                                            retry_count += 1
+                                            continue
+                                        else:
+                                            # 如果重试失败，使用空列表
+                                            album_messages = []
+                                            break
+                                    except Exception as e:
+                                        logger.error(f"Error getting album messages for album {album_id}: {e}")
+                                        retry_count += 1
+                                        if retry_count < max_retries:
+                                            await asyncio.sleep(2 * retry_count)
+                                        else:
+                                            # 如果重试失败，使用空列表
+                                            album_messages = []
                                 
                                 # 筛选出同一相册的消息
                                 same_album_messages = [msg for msg in album_messages if 
                                                     hasattr(msg, 'grouped_id') and 
                                                     msg.grouped_id == album_id]
                                 
-                                print(f"Found {len(same_album_messages)} messages in album {album_id}")
+                                logger.info(f"Found {len(same_album_messages)} messages in album {album_id}")
                                 
                                 # 收集所有相册消息ID，稍后标记为已处理
                                 album_message_ids = [msg.id for msg in same_album_messages]
@@ -821,10 +1185,10 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                                     if album_msg_id != message.id:  # 不要标记当前正在处理的消息
                                         processed_album_message_ids.add(album_msg_id)
                             except Exception as e:
-                                print(f"Error retrieving album messages for album {album_id}: {e}")
+                                logger.error(f"Error retrieving album messages for album {album_id}: {e}")
                                 traceback.print_exc()
                         elif is_album and album_id:
-                            print(f"Found another message (ID: {message.id}) from album {album_id} - already processed")
+                            logger.info(f"Found another message (ID: {message.id}) from album {album_id} - already processed")
                         
                         # 处理媒体文件
                         if message_type not in ["text", "unknown"]:
@@ -835,17 +1199,41 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                             # 下载媒体文件
                             try:
                                 temp_dir_prefix = f"{channel_name}_{channel_id}"
-                                downloaded_files, media_count = await download_all_media_from_message(
-                                    message, channel_dir, temp_dir_prefix
-                                )
                                 
-                                if media_count > 0:
-                                    total_downloaded += media_count
-                                    print(f"Downloaded {media_count} media files from message ID {message.id}")
-                                else:
-                                    print(f"No media files found in message ID {message.id}")
+                                # 添加重试机制下载媒体
+                                retry_count = 0
+                                download_success = False
+                                
+                                while retry_count < max_retries and not download_success:
+                                    try:
+                                        downloaded_files, media_count = await download_all_media_from_message(
+                                            message, channel_dir, temp_dir_prefix
+                                        )
+                                        consecutive_errors = 0  # 重置连续错误计数
+                                        download_success = True
+                                        
+                                        if media_count > 0:
+                                            total_downloaded += media_count
+                                            logger.info(f"Downloaded {media_count} media files from message ID {message.id}")
+                                        else:
+                                            logger.info(f"No media files found in message ID {message.id}")
+                                    except (SecurityError, UnauthorizedError) as e:
+                                        logger.error(f"Security error downloading media from message ID {message.id}: {e}")
+                                        if await handle_connection_error(e, retry_count, max_retries):
+                                            retry_count += 1
+                                            continue
+                                        else:
+                                            logger.warning(f"Failed to download media from message ID {message.id} after security error")
+                                            break
+                                    except Exception as e:
+                                        logger.error(f"Error downloading media from message ID {message.id}: {e}")
+                                        retry_count += 1
+                                        if retry_count < max_retries:
+                                            await asyncio.sleep(2 * retry_count)
+                                        else:
+                                            logger.warning(f"Failed to download media from message ID {message.id} after {max_retries} retries")
                             except Exception as e:
-                                print(f"Error downloading media from message ID {message.id}: {e}")
+                                logger.error(f"Error downloading media from message ID {message.id}: {e}")
                                 traceback.print_exc()
                         elif message_type == "text" and message.text:
                             # 保存文本消息到text目录 - 由于上面已经检查过类型，这里不需要再判断
@@ -861,13 +1249,13 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                                 # 保存文本内容到文件
                                 with open(text_file_path, 'w', encoding='utf-8') as f:
                                     f.write(message.text)
-                                print(f"Saved text message ID {message.id} to {text_file_path}")
+                                logger.info(f"Saved text message ID {message.id} to {text_file_path}")
                                 total_downloaded += 1  # 计入总下载数
                             except Exception as e:
-                                print(f"Error saving text from message ID {message.id}: {e}")
+                                logger.error(f"Error saving text from message ID {message.id}: {e}")
                                 traceback.print_exc()
                         else:
-                            print(f"Skipping message ID {message.id} of type {message_type}")
+                            logger.info(f"Skipping message ID {message.id} of type {message_type}")
                         
                         # 更新进度（同时更新内存和文件）
                         update_last_message_id(schedule_file, message.id)
@@ -881,8 +1269,32 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                             processed_messages.add(album_msg.id)
                             processed_count += 1
                             
-                            # 获取消息类型
-                            album_msg_info = await get_message_info(album_msg)
+                            # 获取消息类型 - 带重试
+                            retry_count = 0
+                            album_msg_info = None
+                            
+                            while retry_count < max_retries and album_msg_info is None:
+                                try:
+                                    album_msg_info = await get_message_info(album_msg)
+                                    consecutive_errors = 0  # 重置连续错误计数
+                                except (SecurityError, UnauthorizedError) as e:
+                                    logger.error(f"Security error getting album message info for ID {album_msg.id}: {e}")
+                                    if await handle_connection_error(e, retry_count, max_retries):
+                                        retry_count += 1
+                                        continue
+                                    else:
+                                        # 如果重试失败，使用默认值
+                                        album_msg_info = {"type": "unknown", "is_album": True}
+                                        break
+                                except Exception as e:
+                                    logger.error(f"Error getting album message info for ID {album_msg.id}: {e}")
+                                    retry_count += 1
+                                    if retry_count < max_retries:
+                                        await asyncio.sleep(2 * retry_count)
+                                    else:
+                                        # 如果重试失败，使用默认值
+                                        album_msg_info = {"type": "unknown", "is_album": True}
+                            
                             album_msg_type = album_msg_info["type"]
                             
                             # 处理相册消息的媒体
@@ -892,21 +1304,43 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                                     album_media_dir = os.path.join(channel_dir, album_msg_type)
                                     os.makedirs(album_media_dir, exist_ok=True)
                                     
-                                    # 下载相册消息的媒体
-                                    album_downloaded_files, album_media_count = await download_all_media_from_message(
-                                        album_msg, channel_dir, temp_dir_prefix
-                                    )
+                                    # 下载相册消息的媒体 - 带重试
+                                    retry_count = 0
+                                    album_download_success = False
                                     
-                                    if album_media_count > 0:
-                                        total_downloaded += album_media_count
-                                        print(f"Downloaded {album_media_count} media files from album message ID {album_msg.id}")
-                                    else:
-                                        print(f"No media files found in album message ID {album_msg.id}")
+                                    while retry_count < max_retries and not album_download_success:
+                                        try:
+                                            album_downloaded_files, album_media_count = await download_all_media_from_message(
+                                                album_msg, channel_dir, temp_dir_prefix
+                                            )
+                                            consecutive_errors = 0  # 重置连续错误计数
+                                            album_download_success = True
+                                            
+                                            if album_media_count > 0:
+                                                total_downloaded += album_media_count
+                                                logger.info(f"Downloaded {album_media_count} media files from album message ID {album_msg.id}")
+                                            else:
+                                                logger.info(f"No media files found in album message ID {album_msg.id}")
+                                        except (SecurityError, UnauthorizedError) as e:
+                                            logger.error(f"Security error downloading media from album message ID {album_msg.id}: {e}")
+                                            if await handle_connection_error(e, retry_count, max_retries):
+                                                retry_count += 1
+                                                continue
+                                            else:
+                                                logger.warning(f"Failed to download media from album message ID {album_msg.id} after security error")
+                                                break
+                                        except Exception as e:
+                                            logger.error(f"Error downloading media from album message ID {album_msg.id}: {e}")
+                                            retry_count += 1
+                                            if retry_count < max_retries:
+                                                await asyncio.sleep(2 * retry_count)
+                                            else:
+                                                logger.warning(f"Failed to download media from album message ID {album_msg.id} after {max_retries} retries")
                                 except Exception as e:
-                                    print(f"Error downloading media from album message ID {album_msg.id}: {e}")
+                                    logger.error(f"Error downloading media from album message ID {album_msg.id}: {e}")
                                     traceback.print_exc()
                             else:
-                                print(f"Skipping album message ID {album_msg.id} of type {album_msg_type}")
+                                logger.info(f"Skipping album message ID {album_msg.id} of type {album_msg_type}")
                             
                             # 更新进度
                             update_last_message_id(schedule_file, album_msg.id)
@@ -914,14 +1348,14 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                         # 进度显示
                         if messages_to_process:
                             progress = min(100.0, (processed_count / messages_to_process * 100))
-                            print(f"Overall progress: {processed_count}/{messages_to_process} messages ({progress:.1f}%)")
+                            logger.info(f"Overall progress: {processed_count}/{messages_to_process} messages ({progress:.1f}%)")
                         
                         # 暂停以避免请求过快
                         await asyncio.sleep(sleep_ms / 1000)
                         
                         # 如果达到消息限制，则退出
                         if msg_limit > 0 and processed_count >= msg_limit:
-                            print(f"Reached message limit of {msg_limit}")
+                            logger.info(f"Reached message limit of {msg_limit}")
                             has_more_messages = False
                             break
                     
@@ -935,25 +1369,25 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                     
                     # 检查是否已经处理完所有消息
                     if current_id > max_id_to_process:
-                        print("Reached the end of message range")
+                        logger.info("Reached the end of message range")
                         has_more_messages = False
                     
                 except Exception as e:
-                    print(f"Error processing batch: {e}")
+                    logger.error(f"Error processing batch: {e}")
                     traceback.print_exc()
                     # 等待一会儿然后继续
                     await asyncio.sleep(5)
                     # 尝试继续下一个批次
                     current_id += batch_size
             
-            print(f"Total downloaded media files: {total_downloaded}")
+            logger.info(f"Total downloaded media files: {total_downloaded}")
             
         except Exception as e:
-            print(f"Error processing channel {channel_id}: {e}")
+            logger.error(f"Error processing channel {channel_id}: {e}")
             traceback.print_exc()
     
     except Exception as e:
-        print(f"Error in process_single_channel: {e}")
+        logger.error(f"Error in process_single_channel: {e}")
         traceback.print_exc()
 
 async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
@@ -1115,80 +1549,134 @@ def print_help():
 
 async def main():
     """Main function"""
-    if len(sys.argv) < 2:
-        print_help()
-        return
-    
-    command = sys.argv[1].lower()
-    
-    if command == "login":
-        await qr_login()
-    elif command == "list":
-        # Call list_dialogs with default batch size of 100
-        await list_dialogs()
-    elif command == "download":
-        # Parse sleep parameter if provided
-        sleep_ms = 500  # Default sleep time in milliseconds
-        limit = 500  # Default number of messages to retrieve
-        allowed_types = ["all"]  # 默认下载所有类型
-        
-        # Check for parameters anywhere in the arguments
-        i = 2
-        while i < len(sys.argv) - 1:
-            if sys.argv[i] == "--sleep":
-                try:
-                    sleep_ms = int(sys.argv[i + 1])
-                    # Remove these arguments to simplify further parsing
-                    sys.argv.pop(i)
-                    sys.argv.pop(i)
-                    continue  # Don't increment i as we've removed elements
-                except (ValueError, IndexError):
-                    print("Invalid sleep value. Using default 500ms.")
-                    i += 2
-            elif sys.argv[i] == "--limit":
-                try:
-                    limit = int(sys.argv[i + 1])
-                    # Remove these arguments to simplify further parsing
-                    sys.argv.pop(i)
-                    sys.argv.pop(i)
-                    continue  # Don't increment i as we've removed elements
-                except (ValueError, IndexError):
-                    print("Invalid limit value. Using default 500 messages.")
-                    i += 2
-            elif sys.argv[i] == "--type":
-                try:
-                    type_value = sys.argv[i + 1]
-                    if type_value and type_value.lower() != "all":
-                        allowed_types = [t.strip().lower() for t in type_value.split(',') if t.strip()]
-                    # Remove these arguments to simplify further parsing
-                    sys.argv.pop(i)
-                    sys.argv.pop(i)
-                    continue  # Don't increment i as we've removed elements
-                except (IndexError):
-                    print("Invalid type value. Using default (all types).")
-                    i += 2
-            else:
-                i += 1
-        
-        # Check if using task file
-        if len(sys.argv) >= 6 and sys.argv[2] == "--file" and sys.argv[4] == "--out":
-            task_file = sys.argv[3]
-            output_dir = sys.argv[5]
-            await download_from_task(task_file, output_dir, sleep_ms, limit)
-        # Traditional download
-        elif len(sys.argv) >= 3:
-            chat_id = sys.argv[2]
-            limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 10
-            await download_media(chat_id, limit, sleep_ms, allowed_types)
-        else:
-            print("Invalid download command")
+    global client, consecutive_errors
+    try:
+        if len(sys.argv) < 2:
             print_help()
-    elif command == "help":
-        print_help()
-    else:
-        print("Unknown command")
-        print_help()
+            return
+        
+        command = sys.argv[1].lower()
+        
+        # 每次启动检查连接状态
+        if not client.is_connected():
+            await client.connect()
+        
+        # 检查是否需要登录
+        if not await client.is_user_authorized():
+            logger.info("Not authorized. Launching QR login...")
+            await qr_login()
+        
+        if command == "login":
+            await qr_login()
+        elif command == "list":
+            # Call list_dialogs with default batch size of 100
+            await list_dialogs()
+        elif command == "download":
+            # Parse sleep parameter if provided
+            sleep_ms = 500  # Default sleep time in milliseconds
+            limit = 500  # Default number of messages to retrieve
+            allowed_types = ["all"]  # 默认下载所有类型
+            
+            # Check for parameters anywhere in the arguments
+            i = 2
+            while i < len(sys.argv) - 1:
+                if sys.argv[i] == "--sleep":
+                    try:
+                        sleep_ms = int(sys.argv[i + 1])
+                        # Remove these arguments to simplify further parsing
+                        sys.argv.pop(i)
+                        sys.argv.pop(i)
+                        continue  # Don't increment i as we've removed elements
+                    except (ValueError, IndexError):
+                        logger.warning("Invalid sleep value. Using default 500ms.")
+                        i += 2
+                elif sys.argv[i] == "--limit":
+                    try:
+                        limit = int(sys.argv[i + 1])
+                        # Remove these arguments to simplify further parsing
+                        sys.argv.pop(i)
+                        sys.argv.pop(i)
+                        continue  # Don't increment i as we've removed elements
+                    except (ValueError, IndexError):
+                        logger.warning("Invalid limit value. Using default 500 messages.")
+                        i += 2
+                elif sys.argv[i] == "--type":
+                    try:
+                        type_value = sys.argv[i + 1]
+                        if type_value and type_value.lower() != "all":
+                            allowed_types = [t.strip().lower() for t in type_value.split(',') if t.strip()]
+                        # Remove these arguments to simplify further parsing
+                        sys.argv.pop(i)
+                        sys.argv.pop(i)
+                        continue  # Don't increment i as we've removed elements
+                    except (IndexError):
+                        logger.warning("Invalid type value. Using default (all types).")
+                        i += 2
+                else:
+                    i += 1
+            
+            # Check if using task file
+            if len(sys.argv) >= 6 and sys.argv[2] == "--file" and sys.argv[4] == "--out":
+                task_file = sys.argv[3]
+                output_dir = sys.argv[5]
+                await download_from_task(task_file, output_dir, sleep_ms, limit)
+            # Traditional download
+            elif len(sys.argv) >= 3:
+                chat_id = sys.argv[2]
+                limit = int(sys.argv[3]) if len(sys.argv) >= 4 else 10
+                await download_media(chat_id, limit, sleep_ms, allowed_types)
+            else:
+                logger.warning("Invalid download command")
+                print_help()
+        elif command == "help":
+            print_help()
+        else:
+            logger.warning("Unknown command")
+            print_help()
+    except SecurityError as e:
+        logger.error(f"Security error in main function: {e}")
+        # 尝试重置会话
+        global consecutive_errors
+        consecutive_errors += 1
+        
+        # 如果连续错误超过阈值，重置会话
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            logger.warning("Too many consecutive errors. Resetting session...")
+            client = reset_session()
+            await client.connect()
+            # 检查是否需要重新登录
+            if not await client.is_user_authorized():
+                logger.warning("Session reset, but user is not authorized. Need to login again.")
+                await qr_login()
+                # 重新运行命令
+                logger.info("Session reset. Please run your command again.")
+            else:
+                logger.info("Session reset successfully. Please run your command again.")
+        else:
+            logger.error("Security error occurred. Try running the command again.")
+        
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        traceback.print_exc()
+        
+        # 如果是致命错误，尝试自动重置会话并推荐用户重新运行
+        logger.warning("An error occurred. If you continue to experience issues, try:")
+        logger.warning("1. Delete the 'telegram_session.session' file")
+        logger.warning("2. Run 'python main.py login' to authorize again")
+        logger.warning("3. Try your command again")
 
 if __name__ == "__main__":
-    with client:
-        client.loop.run_until_complete(main())
+    try:
+        with client:
+            client.loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("\nProgram terminated by user.")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        traceback.print_exc()
+        
+        # 如果是致命错误，尝试自动重置会话并推荐用户重新运行
+        logger.warning("An error occurred. If you continue to experience issues, try:")
+        logger.warning("1. Delete the 'telegram_session.session' file")
+        logger.warning("2. Run 'python main.py login' to authorize again")
+        logger.warning("3. Try your command again")
