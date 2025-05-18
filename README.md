@@ -154,3 +154,29 @@ This tool was created with assistance from an AI programming assistant to help s
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## TODO 
+
+
+## Update 
+
+Comprehensive error handling and recovery mechanisms have been added to resolve "Server sent a very old message with ID..." and "Security error while unpacking a received message" errors. Major improvements include:
+
+Session management mechanism:
+- Added session backup and restore functionality
+- Implemented the ability to reset sessions
+- Added automatic re-login mechanism
+Error handling and retries:
+- Added retry mechanism for all network requests
+- Specially handled SecurityError and UnauthorizedError type errors
+- Implemented exponential backoff strategy to avoid frequent retries
+Continuous error tracking:
+- Track continuous errors through a global counter
+- Automatically reset session when a threshold is reached
+Log management:
+- Convert all output to logging for easy debugging
+- Display detailed error information and recovery steps
+
+These changes will make the script more robust and automatically handle possible sequence number errors and security errors that may occur in the Telegram API. When encountering "Server sent a very old message" and "Security error while unpacking" errors, the script will try to:
+- First try to retry the operation
+- If the error persists, back up and reset the session
+- If necessary, prompt the user to log in again
+- In extreme cases, provide manual recovery steps
