@@ -679,6 +679,7 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
             print(f"Found {len(task_config['tasks'])} tasks in the task file")
             
             # 处理每个任务
+            completed_tasks = 0
             for task_index, task in enumerate(task_config['tasks']):
                 print(f"\n{'='*50}")
                 print(f"Processing task {task_index+1}/{len(task_config['tasks'])}")
@@ -726,6 +727,65 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                     if task_sleep_ms != sleep_ms:
                         print(f"Using task-specific sleep: {task_sleep_ms}ms")
                 
+                # 处理频道名称作为子目录
+                safe_channel_name = re.sub(r'[\\/:*?"<>|]', '_', channel_name)
+                channel_dir = os.path.join(output_dir, safe_channel_name)
+                
+                # 检查此任务是否已完成
+                schedule_file = os.path.join(channel_dir, "schedule.json")
+                
+                # 仅当目录已存在时才检查任务状态
+                if os.path.exists(channel_dir):
+                    try:
+                        # 获取上次处理的消息ID
+                        last_message_id = get_last_message_id(schedule_file)
+                        
+                        # 检查是否能获取到实体
+                        retry_count = 0
+                        max_retries = 3
+                        entity = None
+                        
+                        while retry_count < max_retries:
+                            try:
+                                entity = await client.get_entity(channel_id)
+                                break
+                            except Exception as e:
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    await asyncio.sleep(2 * retry_count)
+                                else:
+                                    logger.error(f"Could not get entity for channel {channel_id}: {e}")
+                        
+                        if entity:
+                            # 获取频道的最新消息ID
+                            retry_count = 0
+                            latest_message_id = 0
+                            
+                            while retry_count < max_retries:
+                                try:
+                                    latest_messages = await client.get_messages(entity, limit=1)
+                                    if latest_messages and len(latest_messages) > 0:
+                                        latest_message_id = latest_messages[0].id
+                                        logger.info(f"Latest message ID: {latest_message_id}")
+                                    break
+                                except Exception as e:
+                                    retry_count += 1
+                                    if retry_count < max_retries:
+                                        await asyncio.sleep(2 * retry_count)
+                                    else:
+                                        logger.error(f"Could not get latest message for channel {channel_id}: {e}")
+                            
+                            # 检查任务是否已完成
+                            if last_message_id >= latest_message_id and latest_message_id > 0:
+                                logger.info(f"Task for channel {channel_name} already completed!")
+                                logger.info(f"Last processed message ID: {last_message_id}, Latest message ID: {latest_message_id}")
+                                logger.info("Skipping this channel as it's already fully downloaded.")
+                                completed_tasks += 1
+                                continue
+                    except Exception as e:
+                        logger.error(f"Error checking task status for channel {channel_name}: {e}")
+                        # 继续处理，即使检查失败
+                
                 # 处理这个任务
                 await process_single_channel(
                     channel_id=channel_id,
@@ -735,6 +795,8 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                     msg_limit=task_limit,
                     allowed_types=allowed_types
                 )
+            
+            logger.info(f"Task processing complete. {completed_tasks} tasks were already completed.")
         else:
             # 兼容单任务格式（直接在顶层有channel_id/id）
             # 获取目标频道（兼容多种键名）
@@ -769,6 +831,64 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                 print("No media types specified in task. No media will be downloaded.")
                 allowed_types = []  # 空列表表示不下载任何类型
             
+            # 处理频道名称作为子目录
+            safe_channel_name = re.sub(r'[\\/:*?"<>|]', '_', channel_name)
+            channel_dir = os.path.join(output_dir, safe_channel_name)
+            
+            # 检查此任务是否已完成
+            schedule_file = os.path.join(channel_dir, "schedule.json")
+            
+            # 仅当目录已存在时才检查任务状态
+            if os.path.exists(channel_dir):
+                try:
+                    # 获取上次处理的消息ID
+                    last_message_id = get_last_message_id(schedule_file)
+                    
+                    # 尝试获取实体
+                    retry_count = 0
+                    max_retries = 3
+                    entity = None
+                    
+                    while retry_count < max_retries:
+                        try:
+                            entity = await client.get_entity(channel_id)
+                            break
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                await asyncio.sleep(2 * retry_count)
+                            else:
+                                logger.error(f"Could not get entity for channel {channel_id}: {e}")
+                    
+                    if entity:
+                        # 获取频道的最新消息ID
+                        retry_count = 0
+                        latest_message_id = 0
+                        
+                        while retry_count < max_retries:
+                            try:
+                                latest_messages = await client.get_messages(entity, limit=1)
+                                if latest_messages and len(latest_messages) > 0:
+                                    latest_message_id = latest_messages[0].id
+                                    logger.info(f"Latest message ID: {latest_message_id}")
+                                break
+                            except Exception as e:
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    await asyncio.sleep(2 * retry_count)
+                                else:
+                                    logger.error(f"Could not get latest message for channel {channel_id}: {e}")
+                        
+                        # 检查任务是否已完成
+                        if last_message_id >= latest_message_id and latest_message_id > 0:
+                            logger.info(f"Task for channel {channel_name} already completed!")
+                            logger.info(f"Last processed message ID: {last_message_id}, Latest message ID: {latest_message_id}")
+                            logger.info("Skipping this channel as it's already fully downloaded.")
+                            return
+                except Exception as e:
+                    logger.error(f"Error checking task status for channel {channel_name}: {e}")
+                    # 继续处理，即使检查失败
+            
             # 处理这个任务
             await process_single_channel(
                 channel_id=channel_id,
@@ -780,7 +900,7 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
             )
     
     except Exception as e:
-        print(f"Error in download_from_task: {e}")
+        logger.error(f"Error in download_from_task: {e}")
         traceback.print_exc()
 
 # 添加一个新函数处理单个频道的下载
@@ -944,6 +1064,12 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             
             # 获取上次处理的消息ID（优先使用内存缓存）
             last_message_id = get_last_message_id(schedule_file)
+            
+            # 检查任务是否已完成
+            if last_message_id >= latest_message_id and latest_message_id > 0:
+                logger.info(f"Task already completed! Last processed message ID ({last_message_id}) >= Latest message ID ({latest_message_id})")
+                logger.info("Skipping this channel as it's already fully downloaded.")
+                return
             
             # 如果有上次的进度，从上次位置继续；否则从第一条消息开始
             if last_message_id and last_message_id > first_message_id:
@@ -1409,6 +1535,31 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
         for media_type in ['text', 'image', 'video', 'voice', 'audio', 'document']:
             media_dir = os.path.join(download_dir, media_type)
             os.makedirs(media_dir, exist_ok=True)
+            
+        # 检查是否已完成下载
+        schedule_file = os.path.join(download_dir, "schedule.json")
+        
+        # 如果目录已存在，检查是否已完成下载
+        if os.path.exists(schedule_file):
+            try:
+                # 获取上次处理的消息ID
+                last_message_id = get_last_message_id(schedule_file)
+                
+                # 获取频道的最新消息ID
+                latest_messages = await client.get_messages(entity, limit=1)
+                if latest_messages and len(latest_messages) > 0:
+                    latest_message_id = latest_messages[0].id
+                    logger.info(f"Latest message ID: {latest_message_id}")
+                    
+                    # 检查是否已完成
+                    if last_message_id >= latest_message_id and latest_message_id > 0:
+                        logger.info(f"Download for {chat_name} already completed!")
+                        logger.info(f"Last processed message ID: {last_message_id}, Latest message ID: {latest_message_id}")
+                        logger.info("Skipping as messages are already fully downloaded.")
+                        return
+            except Exception as e:
+                logger.error(f"Error checking download status: {e}")
+                # 继续处理，即使检查失败
         
         print(f"Downloading media from {chat_name}...")
         print(f"Using sleep interval of {sleep_ms} milliseconds between messages")
