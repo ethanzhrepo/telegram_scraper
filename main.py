@@ -12,6 +12,14 @@ from telethon.tl.functions.messages import GetDialogsRequest
 from telethon.tl.types import InputPeerEmpty, MessageMediaPhoto, MessageMediaDocument, InputMessagesFilterEmpty
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeAudio, DocumentAttributeFilename
 from telethon.tl.types import MessageMediaWebPage
+from telethon.tl.types import MessageService
+try:
+    from telethon.tl.types import MessageMediaContact, MessageMediaGeo, MessageMediaVenue, MessageMediaGame
+    from telethon.tl.types import MessageMediaInvoice, MessageMediaGeoLive, MessageMediaPoll, MessageMediaDice
+    EXTENDED_MEDIA_SUPPORT = True
+except ImportError:
+    # 对于较老版本的telethon，这些类型可能不存在
+    EXTENDED_MEDIA_SUPPORT = False
 from telethon.errors import FloodWaitError, SecurityError, UnauthorizedError, BadRequestError
 import re
 import time
@@ -20,7 +28,14 @@ import random
 
 # 设置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# 设置Telethon的日志级别为WARNING，减少更新相关的日志
+telethon_logger = logging.getLogger('telethon')
+telethon_logger.setLevel(logging.WARNING)
+
+# 设置应用程序的日志级别
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # 全局变量，用于追踪连续错误和重试
 consecutive_errors = 0
@@ -155,37 +170,133 @@ _schedule_cache = {}
 
 def get_message_type(message):
     """Determine the type of message based on its media content"""
-    if message.text and not message.media:
-        return "text"
+    # 首先检查是否是服务消息
+    if isinstance(message, MessageService):
+        logger.info(f"DEBUG: Message {message.id} is a service message")
+        return "service"
     
+    # 检查转发消息
+    is_forwarded = hasattr(message, 'forward') and message.forward is not None
+    
+    # 添加详细的调试信息
+    if is_forwarded:
+        logger.info(f"DEBUG: Message {message.id} is forwarded")
+        logger.info(f"DEBUG: Forward info: {message.forward}")
+        logger.info(f"DEBUG: Message has media: {hasattr(message, 'media') and message.media is not None}")
+        if hasattr(message, 'media') and message.media:
+            logger.info(f"DEBUG: Media type: {type(message.media).__name__}")
+            logger.info(f"DEBUG: Media content: {message.media}")
+    
+    # 对于转发消息，我们仍然需要检查媒体内容
+    # 转发消息的媒体内容通常仍然在message.media中
+    
+    # 首先检查是否有媒体内容
     if message.media:
+        logger.info(f"DEBUG: Message {message.id} has media of type: {type(message.media).__name__}")
+        
         if isinstance(message.media, MessageMediaPhoto):
+            if is_forwarded:
+                logger.info(f"DEBUG: Forwarded message {message.id} contains photo")
             return "image"
         elif isinstance(message.media, MessageMediaWebPage):
+            if is_forwarded:
+                logger.info(f"DEBUG: Forwarded message {message.id} contains webpage")
             return "webpage"
         elif isinstance(message.media, MessageMediaDocument):
+            if is_forwarded:
+                logger.info(f"DEBUG: Forwarded message {message.id} contains document")
+                logger.info(f"DEBUG: Document attributes: {message.media.document.attributes}")
+                logger.info(f"DEBUG: Document mime_type: {getattr(message.media.document, 'mime_type', 'None')}")
+            
             for attribute in message.media.document.attributes:
                 if isinstance(attribute, DocumentAttributeVideo):
+                    if is_forwarded:
+                        logger.info(f"DEBUG: Forwarded message {message.id} identified as video")
                     return "video"
                 elif isinstance(attribute, DocumentAttributeAudio):
                     if attribute.voice:
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as voice")
                         return "voice"
                     elif attribute.voice_note:
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as voice_note")
                         return "voice_note"
                     else:
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as audio")
                         return "audio"
             # Check filename for document type
             for attribute in message.media.document.attributes:
                 if isinstance(attribute, DocumentAttributeFilename):
                     filename = attribute.file_name.lower()
+                    if is_forwarded:
+                        logger.info(f"DEBUG: Forwarded message {message.id} filename: {filename}")
                     if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as image by filename")
                         return "image"
                     elif any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv']):
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as video by filename")
                         return "video"
                     elif any(filename.endswith(ext) for ext in ['.mp3', '.wav', '.ogg', '.flac']):
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as audio by filename")
                         return "audio"
+            if is_forwarded:
+                logger.info(f"DEBUG: Forwarded message {message.id} identified as generic document")
             return "document"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaContact):
+            logger.info(f"DEBUG: Message {message.id} contains contact")
+            return "contact"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaGeo):
+            logger.info(f"DEBUG: Message {message.id} contains location")
+            return "location"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaVenue):
+            logger.info(f"DEBUG: Message {message.id} contains venue")
+            return "location"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaGeoLive):
+            logger.info(f"DEBUG: Message {message.id} contains live location")
+            return "location"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaPoll):
+            logger.info(f"DEBUG: Message {message.id} contains poll")
+            return "poll"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaGame):
+            logger.info(f"DEBUG: Message {message.id} contains game")
+            return "game"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaInvoice):
+            logger.info(f"DEBUG: Message {message.id} contains invoice/payment")
+            return "invoice"
+        elif EXTENDED_MEDIA_SUPPORT and isinstance(message.media, MessageMediaDice):
+            logger.info(f"DEBUG: Message {message.id} contains dice")
+            return "dice"
+        else:
+            # 这里是关键：未知的媒体类型
+            logger.warning(f"DEBUG: Message {message.id} has UNKNOWN media type: {type(message.media).__name__}")
+            logger.warning(f"DEBUG: Full media object: {message.media}")
+            logger.warning(f"DEBUG: Media attributes: {dir(message.media)}")
+            if is_forwarded:
+                logger.info(f"DEBUG: Forwarded message {message.id} has unknown media type: {type(message.media)}")
+    else:
+        logger.info(f"DEBUG: Message {message.id} has no media")
+        if is_forwarded:
+            logger.info(f"DEBUG: Forwarded message {message.id} has no media")
     
+    # 如果没有媒体但有文本内容，返回text
+    if message.text:
+        logger.info(f"DEBUG: Message {message.id} has text content, length: {len(message.text)}")
+        if is_forwarded:
+            logger.info(f"DEBUG: Forwarded message {message.id} identified as text")
+        return "text"
+    
+    # 如果到这里，说明既没有识别的媒体类型，也没有文本
+    logger.warning(f"DEBUG: Message {message.id} - NO media and NO text, returning unknown")
+    logger.warning(f"DEBUG: Message {message.id} full object: {message}")
+    logger.warning(f"DEBUG: Message {message.id} attributes: {dir(message)}")
+    
+    if is_forwarded:
+        logger.info(f"DEBUG: Forwarded message {message.id} type unknown")
     return "unknown"
 
 def load_task_file(task_file):
@@ -390,23 +501,35 @@ async def list_dialogs(limit=100):
 
 # 添加一个函数来处理消息中的所有媒体文件
 async def download_all_media_from_message(message, channel_dir, temp_dir_prefix):
-    """Download all media files from a message, including albums"""
+    """Download all media files from a message, including albums and forwarded messages"""
     global consecutive_errors
     max_retries = 3  # 最大重试次数
     downloaded_files = []
     media_count = 0
     
     try:
+        # 检查是否为转发消息
+        is_forwarded = hasattr(message, 'forward') and message.forward is not None
+        if is_forwarded:
+            logger.info(f"Message ID {message.id} is a forwarded message")
+        
         # 检查消息是否有媒体
         if not message.media:
+            if is_forwarded:
+                logger.info(f"Forwarded message ID {message.id} has no media content")
             return downloaded_files, media_count
         
         # 如果是网页预览，跳过
         if isinstance(message.media, MessageMediaWebPage):
+            logger.info(f"Skipping webpage preview in message ID {message.id}")
             return downloaded_files, media_count
         
         # 获取消息类型
         message_type = get_message_type(message).lower()
+        
+        # 如果是转发消息，在日志中标记
+        if is_forwarded:
+            logger.info(f"Processing forwarded message ID {message.id} of type {message_type}")
         
         # 确定目标目录
         target_dir = os.path.join(channel_dir, message_type)
@@ -414,8 +537,10 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
         
         # 处理主媒体文件
         if message.media:
-            # 生成一个唯一的文件名前缀
+            # 生成一个唯一的文件名前缀，为转发消息添加标记
             file_prefix = f"{message.id}_"
+            if is_forwarded:
+                file_prefix = f"{message.id}_fwd_"
             
             # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
             # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
@@ -467,7 +592,10 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                             # 重命名文件到最终名称
                             os.rename(downloaded_path, final_path)
                             
-                            logger.info(f"Downloaded media to {final_path}")
+                            if is_forwarded:
+                                logger.info(f"Downloaded forwarded media to {final_path}")
+                            else:
+                                logger.info(f"Downloaded media to {final_path}")
                             downloaded_files.append(final_path)
                             consecutive_errors = 0  # 重置连续错误计数
                             break  # 成功下载，跳出重试循环
@@ -522,8 +650,10 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                             break
                 
                 if has_grouped_media:
-                    # 生成一个唯一的文件名前缀
+                    # 生成一个唯一的文件名前缀，为转发消息添加标记
                     grouped_prefix = f"{message.id}_grouped_"
+                    if is_forwarded:
+                        grouped_prefix = f"{message.id}_fwd_grouped_"
                     
                     # 检查目标目录中是否已经存在以该前缀开头的文件
                     # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
@@ -571,7 +701,10 @@ async def download_all_media_from_message(message, channel_dir, temp_dir_prefix)
                                     
                                     os.rename(grouped_downloaded_path, grouped_final_path)
                                     
-                                    logger.info(f"Downloaded grouped media to {grouped_final_path}")
+                                    if is_forwarded:
+                                        logger.info(f"Downloaded forwarded grouped media to {grouped_final_path}")
+                                    else:
+                                        logger.info(f"Downloaded grouped media to {grouped_final_path}")
                                     downloaded_files.append(grouped_final_path)
                                     media_count += 1
                                     consecutive_errors = 0  # 重置连续错误计数
@@ -1120,7 +1253,13 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             processed_count = 0
             max_id_to_process = min(latest_message_id, current_id + msg_limit - 1) if msg_limit > 0 else latest_message_id
             
-            while has_more_messages and current_id <= max_id_to_process:
+            # 改用传统的消息获取方法，而不是基于ID范围
+            logger.info(f"Starting message processing from message ID {current_id}")
+            
+            # 使用min_id来获取消息，从current_id开始
+            min_id = current_id - 1  # min_id是排他的，所以减1以包含current_id
+            
+            while has_more_messages and processed_count < msg_limit:
                 # 显示当前批次和总批次
                 if total_batches:
                     progress_percent = min(100.0, (batch_number / total_batches * 100))
@@ -1128,15 +1267,11 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                 else:
                     logger.info(f"Processing batch #{batch_number}")
                 
-                logger.info(f"Processing messages from ID: {current_id} to approximately {min(current_id + batch_size - 1, max_id_to_process)}")
+                logger.info(f"Getting messages with min_id: {min_id}, limit: {batch_size}")
                 
                 try:
-                    # 获取一批消息 - 使用min_id和max_id参数来指定ID范围
-                    # 这样可以确保按照ID从小到大的顺序获取消息
-                    min_id = current_id
-                    max_id = min(current_id + batch_size - 1, max_id_to_process)
-                    
-                    # 添加重试机制获取消息
+                    # 获取一批消息 - 使用min_id和limit
+                    # 这种方法会获取ID大于min_id的消息，按ID降序排列
                     retry_count = 0
                     messages = None
                     
@@ -1145,51 +1280,67 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                             messages = await client.get_messages(
                                 entity,
                                 limit=batch_size,
-                                min_id=min_id - 1,  # min_id是包含的，所以减1来确保包含current_id
-                                max_id=max_id       # max_id是包含的
+                                min_id=min_id
                             )
                             consecutive_errors = 0  # 成功获取消息，重置连续错误计数
                         except (SecurityError, UnauthorizedError) as e:
-                            logger.error(f"Security error getting messages {min_id}-{max_id}: {e}")
+                            logger.error(f"Security error getting messages with min_id {min_id}: {e}")
                             if await handle_connection_error(e, retry_count, max_retries):
                                 retry_count += 1
                                 continue
                             else:
                                 # 如果重试失败，尝试跳过当前批次
-                                logger.warning(f"Skipping batch {min_id}-{max_id} after repeated errors")
+                                logger.warning(f"Skipping batch with min_id {min_id} after repeated errors")
                                 messages = []
                                 break
                         except Exception as e:
-                            logger.error(f"Error getting messages {min_id}-{max_id}: {e}")
+                            logger.error(f"Error getting messages with min_id {min_id}: {e}")
                             retry_count += 1
                             if retry_count < max_retries:
                                 await asyncio.sleep(2 * retry_count)  # 指数退避
                             else:
                                 # 如果重试失败，尝试跳过当前批次
-                                logger.warning(f"Skipping batch {min_id}-{max_id} after {max_retries} retries")
+                                logger.warning(f"Skipping batch with min_id {min_id} after {max_retries} retries")
                                 messages = []
                     
                     if not messages or len(messages) == 0:
-                        logger.info(f"No messages found in range {min_id} to {max_id}")
-                        # 继续下一个批次
-                        current_id = max_id + 1
-                        batch_number += 1
-                        
-                        # 如果已经达到或超过最大ID，则退出循环
-                        if current_id > max_id_to_process:
-                            logger.info("Reached the end of message range")
-                            has_more_messages = False
-                        
-                        continue
+                        logger.info(f"No more messages found with min_id {min_id}")
+                        has_more_messages = False
+                        break
+                    
+                    # 过滤掉已经处理过的消息
+                    valid_messages = []
+                    for msg in messages:
+                        if msg.id not in processed_messages:
+                            valid_messages.append(msg)
+                    
+                    # 如果没有有效消息，停止处理
+                    if not valid_messages:
+                        logger.info("No new valid messages found")
+                        has_more_messages = False
+                        break
                     
                     # 确保消息按ID排序（从小到大，即时间从早到晚）
-                    messages = sorted(messages, key=lambda m: m.id)
+                    valid_messages = sorted(valid_messages, key=lambda m: m.id)
                     
-                    logger.info(f"Retrieved {len(messages)} messages in this batch (ID range: {messages[0].id} to {messages[-1].id})")
+                    logger.info(f"Retrieved {len(valid_messages)} valid messages in this batch (ID range: {valid_messages[0].id} to {valid_messages[-1].id})")
+                    
+                    # 更新min_id为当前批次最大的消息ID
+                    min_id = valid_messages[-1].id
                     
                     # 处理这批消息
-                    for message in messages:
+                    for message in valid_messages:
                         logger.info(f"Processing message ID: {message.id}")
+                        
+                        # 检查是否为转发消息并添加详细调试信息
+                        is_forwarded = hasattr(message, 'forward') and message.forward is not None
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Found forwarded message {message.id}")
+                            logger.info(f"DEBUG: Message text: {message.text[:100] if message.text else 'None'}...")
+                            logger.info(f"DEBUG: Message media exists: {message.media is not None}")
+                            if message.media:
+                                logger.info(f"DEBUG: Media type: {type(message.media).__name__}")
+                        
                         # 如果消息已经处理过，跳过
                         if message.id in processed_messages:
                             logger.info(f"Skipping already processed message ID {message.id}")
@@ -1236,6 +1387,12 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                         
                         message_type = message_info["type"]
                         logger.info(f"Message type: {message_type}")
+                        
+                        # 为转发消息添加额外的调试信息
+                        if is_forwarded:
+                            logger.info(f"DEBUG: Forwarded message {message.id} type determined as: {message_type}")
+                            if message_type == "unknown":
+                                logger.warning(f"DEBUG: Forwarded message {message.id} could not determine type - this might be why it's not downloading")
                         
                         # 检查当前消息类型是否在允许下载的类型列表中
                         # 如果不在allowed_types中且不是"all"，则跳过此消息
@@ -1493,9 +1650,9 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                     # 更新批次号
                     batch_number += 1
                     
-                    # 检查是否已经处理完所有消息
-                    if current_id > max_id_to_process:
-                        logger.info("Reached the end of message range")
+                    # 检查是否需要继续处理更多消息
+                    if processed_count >= msg_limit:
+                        logger.info("Reached message processing limit")
                         has_more_messages = False
                     
                 except Exception as e:
@@ -1503,8 +1660,8 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                     traceback.print_exc()
                     # 等待一会儿然后继续
                     await asyncio.sleep(5)
-                    # 尝试继续下一个批次
-                    current_id += batch_size
+                    # 更新min_id以尝试继续
+                    min_id = max(1, min_id - batch_size)
             
             logger.info(f"Total downloaded media files: {total_downloaded}")
             
@@ -1577,9 +1734,17 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
         downloaded_files = 0
         
         for message in messages:
+            # 检查是否为转发消息
+            is_forwarded = hasattr(message, 'forward') and message.forward is not None
+            
             # 获取消息类型
             message_type = get_message_type(message)
-            print(f"Processing message ID {message.id} of type: {message_type}")
+            
+            # 为转发消息添加日志信息
+            if is_forwarded:
+                print(f"Processing forwarded message ID {message.id} of type: {message_type}")
+            else:
+                print(f"Processing message ID {message.id} of type: {message_type}")
             
             # 检查类型是否在允许列表中
             if "all" not in allowed_types and message_type not in allowed_types:
@@ -1592,13 +1757,23 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
                 # 保存文本消息
                 text_dir = os.path.join(download_dir, "text")
                 message_datetime = message.date.strftime("%Y%m%d_%H%M%S") if hasattr(message, 'date') else "unknown_date"
-                text_filename = f"{message.id}_{message_datetime}.txt"
+                
+                # 为转发消息添加标记
+                if is_forwarded:
+                    text_filename = f"{message.id}_fwd_{message_datetime}.txt"
+                else:
+                    text_filename = f"{message.id}_{message_datetime}.txt"
+                
                 text_file_path = os.path.join(text_dir, text_filename)
                 
                 try:
                     with open(text_file_path, 'w', encoding='utf-8') as f:
                         f.write(message.text)
-                    print(f"Saved text message ID {message.id} to {text_file_path}")
+                    
+                    if is_forwarded:
+                        print(f"Saved forwarded text message ID {message.id} to {text_file_path}")
+                    else:
+                        print(f"Saved text message ID {message.id} to {text_file_path}")
                     downloaded_files += 1
                 except Exception as e:
                     print(f"Error saving text from message ID {message.id}: {e}")
@@ -1609,8 +1784,11 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
                     # 确定目标目录
                     media_type_dir = os.path.join(download_dir, message_type)
                     
-                    # 生成一个唯一的文件名前缀
-                    file_prefix = f"{message.id}_"
+                    # 生成一个唯一的文件名前缀，为转发消息添加标记
+                    if is_forwarded:
+                        file_prefix = f"{message.id}_fwd_"
+                    else:
+                        file_prefix = f"{message.id}_"
                     
                     # 检查目标目录中是否已经存在以该前缀开头的完整文件（不包含"temp"的文件）
                     # 修复：确保文件名中不包含"temp"，而不仅仅是不以"temp"结尾
@@ -1656,7 +1834,10 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
                             # 重命名文件到最终名称
                             os.rename(downloaded_path, final_path)
                             
-                            print(f"Downloaded to {final_path}")
+                            if is_forwarded:
+                                print(f"Downloaded forwarded media to {final_path}")
+                            else:
+                                print(f"Downloaded to {final_path}")
                             downloaded_files += 1
                 except Exception as e:
                     print(f"Error downloading message ID {message.id}: {e}")
@@ -1696,7 +1877,11 @@ def print_help():
     print("  --sleep <ms>  - Sleep time in milliseconds between message downloads (default: 500)")
     print("  --limit <count> - Number of messages to retrieve for download commands (default: 500)")
     print("  --type <types> - Comma-separated list of content types to download (default: all)")
-    print("\nValid types: text, image, video, audio, voice, document (or 'all' for all types)")
+    print("\nValid types:")
+    print("  Media types: image, video, audio, voice, document")
+    print("  Other types: text, contact, location, poll, game, invoice, dice")
+    print("  Special: webpage, all (for all types)")
+    print("\nNote: Some types like contact, location, poll, etc. are not downloadable but will be logged.")
 
 async def main():
     """Main function"""
