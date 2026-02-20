@@ -197,7 +197,7 @@ def get_message_type(message):
         if isinstance(message.media, MessageMediaPhoto):
             if is_forwarded:
                 logger.info(f"DEBUG: Forwarded message {message.id} contains photo")
-            return "image"
+            return "video"
         elif isinstance(message.media, MessageMediaWebPage):
             if is_forwarded:
                 logger.info(f"DEBUG: Forwarded message {message.id} contains webpage")
@@ -234,8 +234,8 @@ def get_message_type(message):
                         logger.info(f"DEBUG: Forwarded message {message.id} filename: {filename}")
                     if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
                         if is_forwarded:
-                            logger.info(f"DEBUG: Forwarded message {message.id} identified as image by filename")
-                        return "image"
+                            logger.info(f"DEBUG: Forwarded message {message.id} identified as video by filename")
+                        return "video"
                     elif any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv']):
                         if is_forwarded:
                             logger.info(f"DEBUG: Forwarded message {message.id} identified as video by filename")
@@ -383,111 +383,123 @@ async def qr_login():
     await qr_login.wait()
     print("Login successful!")
 
-async def list_dialogs(limit=100):
+async def list_dialogs(limit=None):
     """List all dialogs (chats and channels)
     
-    This function automatically fetches all dialogs by making multiple requests
-    with appropriate offset values. The limit parameter controls how many dialogs
-    are fetched in each request.
+    This function automatically fetches all dialogs using Telethon's built-in 
+    get_dialogs method, which is highly optimized and caches entity data.
     """
-    global consecutive_errors
-    max_retries = 3  # 最大重试次数
-    total_count = 0
+    from rich.console import Console
+    from rich.table import Table
+    from telethon.tl.types import Channel, Chat, User
     
-    # For pagination
-    offset_date = None
-    offset_id = 0
-    offset_peer = InputPeerEmpty()
+    console = Console()
     
-    logger.info(f"Fetching all dialogs (in batches of {limit})...")
-    logger.info("\nDialogs:")
-    
-    while True:
-        retry_count = 0
-        success = False
-        
-        while retry_count < max_retries and not success:
+    # 获取任务列表中的配置的所有 ID
+    task_ids = set()
+    for task_file_name in ["task.yml", "task1.yml", "task1 copy.yml"]:
+        if os.path.exists(task_file_name):
             try:
-                result = await client(GetDialogsRequest(
-                    offset_date=offset_date,
-                    offset_id=offset_id,
-                    offset_peer=offset_peer,
-                    limit=limit,
-                    hash=0
-                ))
+                task_data = load_task_file(task_file_name)
+                if task_data and 'tasks' in task_data and isinstance(task_data['tasks'], list):
+                    for task in task_data['tasks']:
+                        if 'channel_id' in task: task_ids.add(str(task['channel_id']))
+                        elif 'id' in task: task_ids.add(str(task['id']))
+                elif task_data: # single task format
+                    if 'channel_id' in task_data: task_ids.add(str(task_data['channel_id']))
+                    elif 'id' in task_data: task_ids.add(str(task_data['id']))
+            except Exception as e:
+                logger.debug(f"Error reading {task_file_name}: {e}")
+    
+    dialog_rows = []
+    
+    with console.status("[bold green]Fetching all dialogs (fast mode)...[/]") as status:
+        try:
+            # 采用高层 get_dialogs API 获取，它能够隐式完成自动实体提取，大幅降低请求耗时
+            # Limit=None 指获取所有，强制设置 limit 为 None 确保获取全部结果
+            dialogs = await client.get_dialogs(limit=None)
+            
+            for dialog in dialogs:
+                entity = dialog.entity
+                name = dialog.name
                 
-                # 重置连续错误计数
-                consecutive_errors = 0
-                success = True
-                
-                # If no dialogs returned, we've reached the end
-                if not result.dialogs:
-                    logger.info("No more dialogs found.")
-                    return
-                    
-                # Process and display each dialog immediately
-                for dialog in result.dialogs:
-                    try:
-                        entity = await client.get_entity(dialog.peer)
-                        name = getattr(entity, 'title', getattr(entity, 'first_name', ''))
-                        logger.info(f"ID: {entity.id} - Name: {name}")
-                        total_count += 1
-                    except Exception as e:
-                        logger.error(f"Error getting entity: {e}")
-                
-                logger.info(f"Fetched {len(result.dialogs)} more dialogs. Total so far: {total_count}")
-                
-                # If we got fewer dialogs than requested, we've reached the end
-                if len(result.dialogs) < limit:
-                    logger.info("Reached the end of the dialog list.")
-                    return
-                    
-                # Update offset for next iteration - use the last dialog as reference
-                last_dialog = result.dialogs[-1]
-                last_message = None
-                
-                # Find the message corresponding to the last dialog
-                for message in result.messages:
-                    if message.peer_id == last_dialog.peer:
-                        last_message = message
-                        break
-                
-                if last_message:
-                    offset_date = last_message.date
-                    offset_id = last_message.id
-                else:
-                    # Fallback if we can't find the corresponding message
-                    offset_id = last_dialog.top_message
-                    
-                offset_peer = last_dialog.peer
-                
-                # Add a small delay to avoid hitting rate limits
-                await asyncio.sleep(0.5)
-                
-            except SecurityError as e:
-                consecutive_errors += 1
-                logger.error(f"Security error fetching dialogs: {e}")
-                
-                # 处理安全错误
-                if await handle_connection_error(e, retry_count, max_retries):
-                    retry_count += 1
+                # 判断类型
+                if isinstance(entity, Channel):
+                    entity_type = "Supergroup" if getattr(entity, 'megagroup', False) else "Channel"
+                elif isinstance(entity, Chat):
+                    entity_type = "Group"
+                elif isinstance(entity, User):
+                    # 按照用户要求，去掉User类型的，只保留group/supergroup/channel
                     continue
                 else:
-                    logger.error("Failed to recover from security error after multiple retries")
-                    return
-            except Exception as e:
-                logger.error(f"Error fetching dialogs: {e}")
-                traceback.print_exc()
+                    entity_type = "Unknown"
                 
-                retry_count += 1
-                if retry_count < max_retries:
-                    # 指数退避
-                    await asyncio.sleep(2 * retry_count)
-                else:
-                    logger.error(f"Failed to fetch dialogs after {max_retries} retries. Stopping.")
-                    return
+                entity_id_str = str(dialog.id)
+                raw_id = str(getattr(entity, 'id', ''))
+                
+                in_task_mark = "✅" if (entity_id_str in task_ids or raw_id in task_ids) else ""
+                
+                dialog_rows.append((in_task_mark, entity_id_str, entity_type, name))
+                
+        except Exception as e:
+            logger.error(f"Error fetching dialogs: {e}")
+            traceback.print_exc()
     
-    logger.info(f"\nFound {total_count} dialogs in total.")
+    # 采用交互式翻页展示
+    import sys
+    import tty
+    import termios
+    import asyncio
+    
+    def get_keypress():
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch += sys.stdin.read(2)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+    page_size = 30
+    total_pages = max(1, (len(dialog_rows) + page_size - 1) // page_size)
+    current_page = 0
+    loop = asyncio.get_event_loop()
+    
+    while True:
+        console.clear()
+        
+        table = Table(title=f"Telegram Dialogs (Total Found: {len(dialog_rows)}) - Page {current_page + 1}/{total_pages}", show_header=True, header_style="bold magenta")
+        table.add_column("In Task", justify="center", style="green", width=8)
+        table.add_column("ID", justify="left", style="cyan")
+        table.add_column("Type", justify="left", style="yellow")
+        table.add_column("Name", justify="left", style="white")
+        
+        start_idx = current_page * page_size
+        end_idx = min(start_idx + page_size, len(dialog_rows))
+        
+        for i in range(start_idx, end_idx):
+            table.add_row(*dialog_rows[i])
+            
+        console.print(table)
+        console.print("\n[bold cyan]Use ← (Left) / → (Right) arrows to navigate. Press 'q' or Ctrl+C to quit.[/]")
+        
+        try:
+            key = await loop.run_in_executor(None, get_keypress)
+        except Exception:
+            break
+            
+        if key.lower() == 'q' or key == '\x03':  # q or Ctrl+C
+            console.clear()
+            break
+        elif key in ('\x1b[D', '\x1b[A'):  # Left / Up
+            if current_page > 0:
+                current_page -= 1
+        elif key in ('\x1b[C', '\x1b[B'):  # Right / Down
+            if current_page < total_pages - 1:
+                current_page += 1
 
 # 添加文件哈希计算函数
 # def calculate_file_hash(file_path):
@@ -844,6 +856,9 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
                 if 'type' in task and task['type']:
                     # 解析类型配置，确保所有类型都转换为小写并去除空白
                     allowed_types = [t.strip().lower() for t in task['type'].split(',') if t.strip()]
+                    # image 已合并到 video 目录，将 image 类型映射为 video
+                    allowed_types = ['video' if t == 'image' else t for t in allowed_types]
+                    allowed_types = list(dict.fromkeys(allowed_types))  # 去重并保持顺序
                     print(f"Only downloading media types: {', '.join(allowed_types)}")
                 
                 # 获取消息限制
@@ -958,6 +973,9 @@ async def download_from_task(task_file, output_dir, sleep_ms=500, msg_limit=500)
             if 'type' in task_config and task_config['type']:
                 # 解析类型配置，确保所有类型都转换为小写并去除空白
                 allowed_types = [t.strip().lower() for t in task_config['type'].split(',') if t.strip()]
+                # image 已合并到 video 目录，将 image 类型映射为 video
+                allowed_types = ['video' if t == 'image' else t for t in allowed_types]
+                allowed_types = list(dict.fromkeys(allowed_types))  # 去重并保持顺序
                 print(f"Only downloading media types: {', '.join(allowed_types)}")
             else:
                 # 如果没有指定类型，则不下载任何内容
@@ -1088,10 +1106,10 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
             os.makedirs(channel_dir, exist_ok=True)
             
             # 创建各媒体类型的子目录
-            for media_type in ['text', 'image', 'video', 'voice', 'audio', 'document']:
+            for media_type in ['text', 'video', 'voice', 'audio', 'document']:
                 media_dir = os.path.join(channel_dir, media_type)
                 os.makedirs(media_dir, exist_ok=True)
-            
+
             # 获取频道的所有消息
             logger.info(f"Downloading media from {channel_name} ({channel_id})")
             
@@ -1689,7 +1707,7 @@ async def download_media(chat_id, limit=10, sleep_ms=500, allowed_types=None):
         os.makedirs(download_dir, exist_ok=True)
         
         # 为每种媒体类型创建子目录
-        for media_type in ['text', 'image', 'video', 'voice', 'audio', 'document']:
+        for media_type in ['text', 'video', 'voice', 'audio', 'document']:
             media_dir = os.path.join(download_dir, media_type)
             os.makedirs(media_dir, exist_ok=True)
             
@@ -1878,7 +1896,7 @@ def print_help():
     print("  --limit <count> - Number of messages to retrieve for download commands (default: 500)")
     print("  --type <types> - Comma-separated list of content types to download (default: all)")
     print("\nValid types:")
-    print("  Media types: image, video, audio, voice, document")
+    print("  Media types: video (includes image), audio, voice, document")
     print("  Other types: text, contact, location, poll, game, invoice, dice")
     print("  Special: webpage, all (for all types)")
     print("\nNote: Some types like contact, location, poll, etc. are not downloadable but will be logged.")
@@ -1941,6 +1959,9 @@ async def main():
                         type_value = sys.argv[i + 1]
                         if type_value and type_value.lower() != "all":
                             allowed_types = [t.strip().lower() for t in type_value.split(',') if t.strip()]
+                            # image 已合并到 video 目录，将 image 类型映射为 video
+                            allowed_types = ['video' if t == 'image' else t for t in allowed_types]
+                            allowed_types = list(dict.fromkeys(allowed_types))  # 去重并保持顺序
                         # Remove these arguments to simplify further parsing
                         sys.argv.pop(i)
                         sys.argv.pop(i)
