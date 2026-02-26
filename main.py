@@ -207,7 +207,16 @@ def get_message_type(message):
                 logger.info(f"DEBUG: Forwarded message {message.id} contains document")
                 logger.info(f"DEBUG: Document attributes: {message.media.document.attributes}")
                 logger.info(f"DEBUG: Document mime_type: {getattr(message.media.document, 'mime_type', 'None')}")
-            
+
+            # 优先检查 MessageMediaDocument 上的直接旗标（新版 Telegram API）
+            # 这些旗标比 document.attributes 列表更可靠，spoiler/加密视频通常只设置这些旗标
+            if getattr(message.media, 'round', False):
+                return "video"
+            if getattr(message.media, 'video', False):
+                return "video"
+            if getattr(message.media, 'voice', False):
+                return "voice"
+
             for attribute in message.media.document.attributes:
                 if isinstance(attribute, DocumentAttributeVideo):
                     if is_forwarded:
@@ -232,18 +241,32 @@ def get_message_type(message):
                     filename = attribute.file_name.lower()
                     if is_forwarded:
                         logger.info(f"DEBUG: Forwarded message {message.id} filename: {filename}")
-                    if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
+                    if any(filename.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.heic', '.heif']):
                         if is_forwarded:
                             logger.info(f"DEBUG: Forwarded message {message.id} identified as video by filename")
                         return "video"
-                    elif any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv']):
+                    elif any(filename.endswith(ext) for ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.ts']):
                         if is_forwarded:
                             logger.info(f"DEBUG: Forwarded message {message.id} identified as video by filename")
                         return "video"
-                    elif any(filename.endswith(ext) for ext in ['.mp3', '.wav', '.ogg', '.flac']):
+                    elif any(filename.endswith(ext) for ext in ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.opus']):
                         if is_forwarded:
                             logger.info(f"DEBUG: Forwarded message {message.id} identified as audio by filename")
                         return "audio"
+            # 通过 mime_type 兜底判断：以文件形式发送的图片（无文件名或扩展名不匹配）
+            doc_mime = getattr(message.media.document, 'mime_type', '') or ''
+            if doc_mime.startswith('image/'):
+                if is_forwarded:
+                    logger.info(f"DEBUG: Forwarded message {message.id} identified as image by mime_type: {doc_mime}")
+                return "video"
+            elif doc_mime.startswith('video/'):
+                if is_forwarded:
+                    logger.info(f"DEBUG: Forwarded message {message.id} identified as video by mime_type: {doc_mime}")
+                return "video"
+            elif doc_mime.startswith('audio/'):
+                if is_forwarded:
+                    logger.info(f"DEBUG: Forwarded message {message.id} identified as audio by mime_type: {doc_mime}")
+                return "audio"
             if is_forwarded:
                 logger.info(f"DEBUG: Forwarded message {message.id} identified as generic document")
             return "document"
@@ -413,16 +436,16 @@ async def list_dialogs(limit=None):
     
     dialog_rows = []
     
-    with console.status("[bold green]Fetching all dialogs (fast mode)...[/]") as status:
+    with console.status("[bold green]Fetching all dialogs...[/]") as status:
         try:
-            # 采用高层 get_dialogs API 获取，它能够隐式完成自动实体提取，大幅降低请求耗时
-            # Limit=None 指获取所有，强制设置 limit 为 None 确保获取全部结果
-            dialogs = await client.get_dialogs(limit=None)
-            
-            for dialog in dialogs:
+            # 使用 iter_dialogs() 替代 get_dialogs(limit=None)
+            # get_dialogs(limit=None) 存在已知分页 bug（见 Telethon #711、#896）：
+            # 在账号有置顶对话时 offset 计算会失效，导致部分群组/频道被跳过。
+            # iter_dialogs() 是异步迭代版本，分页逻辑更健壮，且内存占用更低。
+            async for dialog in client.iter_dialogs():
                 entity = dialog.entity
                 name = dialog.name
-                
+
                 # 判断类型
                 if isinstance(entity, Channel):
                     entity_type = "Supergroup" if getattr(entity, 'megagroup', False) else "Channel"
@@ -433,14 +456,15 @@ async def list_dialogs(limit=None):
                     continue
                 else:
                     entity_type = "Unknown"
-                
+
                 entity_id_str = str(dialog.id)
                 raw_id = str(getattr(entity, 'id', ''))
-                
+
                 in_task_mark = "✅" if (entity_id_str in task_ids or raw_id in task_ids) else ""
-                
+
                 dialog_rows.append((in_task_mark, entity_id_str, entity_type, name))
-                
+                status.update(f"[bold green]Fetching all dialogs... (found {len(dialog_rows)} groups/channels)[/]")
+
         except Exception as e:
             logger.error(f"Error fetching dialogs: {e}")
             traceback.print_exc()
@@ -1298,7 +1322,8 @@ async def process_single_channel(channel_id, channel_name, output_dir, sleep_ms=
                             messages = await client.get_messages(
                                 entity,
                                 limit=batch_size,
-                                min_id=min_id
+                                min_id=min_id,
+                                reverse=True
                             )
                             consecutive_errors = 0  # 成功获取消息，重置连续错误计数
                         except (SecurityError, UnauthorizedError) as e:
